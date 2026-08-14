@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CompassLM structure RAG evaluation case",
+  "type": "object",
+  "required": ["id", "query", "source_type", "answerable", "expected_refs"],
+  "properties": {
+    "id": {"type": "string", "minLength": 1},
+    "query": {"type": "string", "minLength": 1},
+    "source_type": {"enum": ["hwpx", "xlsx"]},
+    "category": {"type": "string"},
+    "answerable": {"type": "boolean"},
+    "expected_refs": {"type": "array", "items": {"type": "string"}},
+    "accepted_answers": {"type": "array", "items": {"type": "string"}},
+    "numeric_signatures": {"type": "array", "items": {"type": "string"}}
+  },
+  "additionalProperties": true
+}

@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CompassLM - 지침서 챗봇</title>
+    <link rel="stylesheet" href="static/style.css">
+    <link rel="icon" type="image/jpeg" href="static/compass_icon.jpeg">
+</head>
+<body>
+
+<div id="auth-overlay" class="auth-overlay">
+    <section class="login-panel" aria-label="CompassLM 계정">
+        <div class="auth-intro">
+            <img src="static/compass_icon.jpeg" alt="CompassLM" class="login-logo">
+            <div>
+                <div class="login-title">CompassLM</div>
+                <div class="login-subtitle">폐쇄망 문서 근거를 계정별로 분리해 관리합니다.</div>
+            </div>
+            <div class="auth-note">업로드 문서, 대화 이력, OCR 작업은 로그인한 계정 기준으로만 표시됩니다.</div>
+        </div>
+        <div class="auth-forms">
+            <div class="auth-mode-switch" role="tablist" aria-label="계정 메뉴">
+                <button id="auth-mode-login" class="auth-mode-btn active" type="button" aria-selected="true">로그인</button>
+                <button id="auth-mode-register" class="auth-mode-btn" type="button" aria-selected="false">계정 만들기</button>
+            </div>
+            <form id="login-form" class="auth-form">
+                <label class="login-label" for="login-id">아이디</label>
+                <input id="login-id" class="login-input" name="login_id" autocomplete="username" required>
+                <label class="login-label" for="login-password">비밀번호</label>
+                <input id="login-password" class="login-input" name="password" type="password" autocomplete="current-password" required>
+                <button id="login-submit" class="login-submit" type="submit">로그인</button>
+            </form>
+            <form id="register-form" class="auth-form" hidden>
+                <label class="login-label" for="register-id">아이디</label>
+                <input id="register-id" class="login-input" name="login_id" autocomplete="username" required>
+                <label class="login-label" for="register-display-name">표시 이름</label>
+                <input id="register-display-name" class="login-input" name="display_name" autocomplete="name">
+                <label class="login-label" for="register-password">비밀번호</label>
+                <input id="register-password" class="login-input" name="password" type="password" autocomplete="new-password" required>
+                <label class="login-label" for="register-password-confirm">비밀번호 확인</label>
+                <input id="register-password-confirm" class="login-input" name="password_confirm" type="password" autocomplete="new-password" required>
+                <button id="register-submit" class="login-submit" type="submit">계정 만들기</button>
+            </form>
+            <div id="login-error" class="login-error" role="alert"></div>
+        </div>
+    </section>
+</div>
+
+<div id="sidebar">
+    <div class="sidebar-header">
+        <img src="static/compass_icon.jpeg" alt="Logo" class="logo">
+        <div class="brand-meta">
+            <span class="brand-name">CompassLM</span>
+            <span class="brand-subtitle">폐쇄망 문서 어시스턴트</span>
+        </div>
+    </div>
+
+    <div class="sidebar-item new-chat" id="create-kb-btn">
+        <span>+</span> 지침서 공간 만들기
+    </div>
+
+    <div id="kb-list">
+        <!-- KB Items will be injected here -->
+    </div>
+
+    <div class="sidebar-footer">
+        <div class="upload-role-box">
+            <label class="upload-role-label" for="upload-doc-role">업로드 문서 유형</label>
+            <select id="upload-doc-role">
+                <option value="" selected>유형 선택</option>
+                <option value="guide">지침서</option>
+                <option value="casebook">사례집(Q&A)</option>
+            </select>
+        </div>
+        <div class="sidebar-item" id="upload-trigger">
+            <span>📂</span> 문서 업로드
+        </div>
+    </div>
+    <input type="file" id="file-input" style="display: none;" accept=".txt,.xlsx,.pdf,.hwpx">
+</div>
+
+<div id="main">
+    <div id="chat-header">
+        <h2 id="current-kb-name">지침서 챗봇</h2>
+        <div id="chat-header-actions">
+            <span id="auth-user-badge" class="auth-user-badge"></span>
+            <button id="logout-btn" class="logout-btn" type="button">로그아웃</button>
+            <div id="ocr-status-widget" class="ocr-status-widget" hidden>
+                <button id="ocr-status-trigger" class="ocr-status-trigger" type="button" aria-label="OCR 진행 상태" aria-expanded="false">!</button>
+                <div id="ocr-status-popover" class="ocr-status-popover" role="status"></div>
+            </div>
+            <!-- TEMP: 관리자 QA 평가 모드 버튼 (배포 시 주석 처리 가능) -->
+            <button id="admin-mode-btn" class="admin-mode-btn" type="button" aria-pressed="false">관리자 모드: OFF</button>
+            <button id="wiki-panel-btn" class="wiki-panel-btn" type="button" aria-expanded="false">Wiki</button>
+            <span class="header-badge">Grounded RAG</span>
+        </div>
+    </div>
+
+    <div id="chat-container">
+        <!-- Messages will go here -->
+        <div class="message assistant">
+            <div class="message-content">
+                <div class="avatar-icon">🤖</div>
+                <div class="bubble">
+                    <div class="bubble-text">안녕하세요. 편하게 질문해 주시면, 지침서나 규정 문서를 바탕으로 차근차근 안내해 드리겠습니다.</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <section id="wiki-panel" class="wiki-panel" aria-label="Wiki" hidden>
+        <div class="wiki-panel-header">
+            <div>
+                <div class="wiki-panel-title">Wiki</div>
+                <div id="wiki-panel-kb" class="wiki-panel-subtitle"></div>
+            </div>
+            <button id="wiki-panel-close" class="wiki-panel-close" type="button" aria-label="닫기">×</button>
+        </div>
+        <div class="wiki-panel-actions">
+            <button id="wiki-refresh-btn" class="wiki-action-btn" type="button">새로고침</button>
+            <button id="wiki-export-btn" class="wiki-action-btn" type="button">내보내기</button>
+            <button id="wiki-lint-btn" class="wiki-action-btn" type="button" hidden>점검</button>
+        </div>
+        <div id="wiki-panel-status" class="wiki-panel-status"></div>
+        <div id="wiki-page-list" class="wiki-page-list"></div>
+        <textarea id="wiki-export-output" class="wiki-export-output" readonly hidden></textarea>
+    </section>
+
+    <div id="input-area">
+        <div id="input-box">
+            <button id="upload-btn" title="파일 업로드">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"></path>
+                </svg>
+            </button>
+            <textarea id="user-input" rows="1" placeholder="메시지를 입력하세요..."></textarea>
+            <button id="send-btn">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <line x1="22" y1="2" x2="11" y2="13"></line>
+                    <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+                </svg>
+            </button>
+        </div>
+        <div class="footer-text">CompassLM은 폐쇄망 환경에서 업로드된 지침서 근거로만 답변합니다.</div>
+    </div>
+</div>
+
+<script src="static/script.js"></script>
+
+</body>
+</html>

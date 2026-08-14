@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CompassLM structure RAG evaluation result",
+  "type": "object",
+  "required": ["case_id", "ranked_refs", "ranked_parent_keys", "answer", "citation_refs"],
+  "properties": {
+    "case_id": {"type": "string", "minLength": 1},
+    "ranked_refs": {"type": "array", "items": {"type": "string"}},
+    "ranked_parent_keys": {"type": "array", "items": {"type": "string"}},
+    "answer": {"type": "string"},
+    "citation_refs": {"type": "array", "items": {"type": "string"}},
+    "retrieval_ms": {"type": "number", "minimum": 0},
+    "total_ms": {"type": "number", "minimum": 0}
+  },
+  "additionalProperties": true
+}
