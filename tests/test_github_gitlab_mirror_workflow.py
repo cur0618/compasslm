@@ -15,6 +15,8 @@ class GitHubGitLabMirrorWorkflowTests(unittest.TestCase):
 
         self.assertIn("push:", text)
         self.assertIn("workflow_dispatch:", text)
+        self.assertIn("# GitHub에서 작업한 브랜치·태그 변경은 공공 GitLab에 자동 반영됩니다.", text)
+        self.assertIn("# GitHub를 기준 저장소로 사용하며, 필요하면 Actions 화면에서 수동 실행할 수 있습니다.", text)
         self.assertIn("secrets.AIGOV_GITLAB_TOKEN", text)
         self.assertNotIn("AIGOV_GITLAB_TOKEN:", text)
         self.assertIn("https://oauth2:${{ secrets.AIGOV_GITLAB_TOKEN }}@", text)
