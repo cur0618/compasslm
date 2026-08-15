@@ -1,3 +1,4 @@
+.github/workflows/mirror-to-aigov-gitlab.yml
 .gitignore
 LICENSE
 PUBLIC_RELEASE_MANIFEST.txt
@@ -107,6 +108,7 @@ tests/test_file_display_names.py
 tests/test_followup_and_history_behavior.py
 tests/test_frontend_session_persistence.py
 tests/test_frontend_visual_contract.py
+tests/test_github_gitlab_mirror_workflow.py
 tests/test_hwpx_integration_contract.py
 tests/test_hwpx_loader.py
 tests/test_hwpx_upload_validation.py

@@ -1,0 +1,27 @@
+name: GitHub에서 공공 GitLab로 동기화
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aigov-gitlab-mirror-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  push-to-aigov-gitlab:
+    name: 공공 GitLab에 브랜치와 태그 반영
+    runs-on: ubuntu-latest
+    steps:
+      - name: GitHub 원본 저장소의 모든 참조 복제
+        run: git clone --bare "https://github.com/${{ github.repository }}.git" source.git
+
+      - name: 공공 GitLab에 새 브랜치와 태그 반영
+        working-directory: source.git
+        run: |
+          git remote add gitlab "https://oauth2:${{ secrets.AIGOV_GITLAB_TOKEN }}@gitlab.aigov.go.kr/cur0618/compasslm.git"
+          git push gitlab --all
+          git push gitlab --tags
