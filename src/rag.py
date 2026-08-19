@@ -1,14 +1,17 @@
 import hashlib
 import heapq
 import json
+import math
 import os
 import pickle
 import re
 import requests
 import shutil
 import sqlite3
+import sys
 import threading
 import time
+import unicodedata
 import uuid
 from collections import OrderedDict
 from datetime import datetime
@@ -21,7 +24,43 @@ from sentence_transformers import SentenceTransformer
 from src.answer_validation import is_numeric_evidence_query, is_weak_ocr_hint_text
 from src.document_structure import build_embedding_text, chunk_structure_records, normalize_structure_record
 from src.hwpx_loader import load_hwpx_records
-from src.pdf_ocr import extract_pdf_pages, extract_pdf_pages_with_paddleocr_vl, release_cached_ocr_model
+from src.persistence_retention import prune_timestamped_rows
+from src.rag_text_markers import (
+    ANSWER_COLUMN_MARKERS,
+    EMBEDDING_DIMENSION_PROBE_TEXT,
+    LABEL_ANSWER_PRIORITY,
+    LABEL_BODY,
+    LABEL_LATEST,
+    LABEL_LATEST_UPLOAD_REFLECTED,
+    LABEL_LATEST_UPLOAD_REFLECTED_AT,
+    LABEL_LINE,
+    LABEL_LOCATION,
+    LABEL_NO_LOCATION,
+    LABEL_QUESTION,
+    LABEL_ROW,
+    LABEL_SOURCE,
+    LABEL_SOURCE_SUMMARY,
+    LABEL_UPLOAD,
+    NORMALIZED_BUNDLE_LABEL,
+    QUESTION_COLUMN_MARKERS,
+    TABLE_HINT_MARKERS,
+    TABLE_ROW_SUMMARY_MARKER,
+    TABLE_SEMANTIC_ROW_MARKER,
+    normalized_bundle_header,
+    normalized_bundle_section,
+)
+try:
+    from src.pdf_ocr import (
+        extract_pdf_pages,
+        extract_pdf_pages_with_paddleocr_vl,
+        release_cached_ocr_model,
+        shutdown_persistent_ocr_worker,
+    )
+except ImportError:
+    from src.pdf_ocr import extract_pdf_pages, extract_pdf_pages_with_paddleocr_vl, release_cached_ocr_model
+
+    def shutdown_persistent_ocr_worker(*, clear_error: bool = True) -> None:
+        return None
 from src.table_alias import alias_match_boost
 from src.ontology_store import OntologyStore
 from src.utils import chunk_txt_items, chunk_xlsx_rows, load_txt, load_xlsx
@@ -42,15 +81,22 @@ DEFAULT_QWEN_QUERY_INSTRUCTION = os.getenv(
 DOC_ROLE_GUIDE = "guide"
 DOC_ROLE_CASEBOOK = "casebook"
 DOC_ROLE_UNKNOWN = "unknown"
+_HANGUL_TERM_CLASS = r"0-9A-Za-z\u3131-\u318E\uAC00-\uD7A3"
+_OVERLAP_TERM_RE = re.compile(rf"[{_HANGUL_TERM_CLASS}]+")
+_SLUG_DISALLOWED_RE = re.compile(r"[^0-9a-z\u3131-\u318e\uac00-\ud7a3]+")
+_QUOTED_LITERAL_RE = re.compile(
+    r'["\'\u2018\u2019\u201c\u201d]([^"\'\u2018\u2019\u201c\u201d]{2,80})["\'\u2018\u2019\u201c\u201d]'
+)
+_MIXED_LITERAL_RE = re.compile(
+    rf"[{_HANGUL_TERM_CLASS}][{_HANGUL_TERM_CLASS}_\-/]{{2,40}}"
+)
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?。\u3002\uff01\uff1f])\s+")
 DOC_ROLE_ALIASES = {
     "guide": DOC_ROLE_GUIDE,
     "guideline": DOC_ROLE_GUIDE,
     "guidelines": DOC_ROLE_GUIDE,
     "manual": DOC_ROLE_GUIDE,
     "instruction": DOC_ROLE_GUIDE,
-    "지침": DOC_ROLE_GUIDE,
-    "지침서": DOC_ROLE_GUIDE,
-    "규정": DOC_ROLE_GUIDE,
     "rule": DOC_ROLE_GUIDE,
     "rules": DOC_ROLE_GUIDE,
     "casebook": DOC_ROLE_CASEBOOK,
@@ -59,9 +105,6 @@ DOC_ROLE_ALIASES = {
     "qa": DOC_ROLE_CASEBOOK,
     "q&a": DOC_ROLE_CASEBOOK,
     "faq": DOC_ROLE_CASEBOOK,
-    "질답": DOC_ROLE_CASEBOOK,
-    "사례": DOC_ROLE_CASEBOOK,
-    "사례집": DOC_ROLE_CASEBOOK,
 }
 
 def _is_pymupdf_page_parser(parser: str) -> bool:
@@ -120,9 +163,43 @@ def _summarize_pdf_chunk_pages(
             "ocr_elapsed_seconds": None,
             "ocr_pages_processed": None,
             "ocr_pages_per_minute": None,
+            "ocr_pages_attempted": None,
+            "ocr_pages_emitted": None,
+            "ocr_pages_skipped_empty": None,
+            "ocr_pages_skipped_short_text": None,
+            "ocr_attempted_pages_per_minute": None,
+            "ocr_emitted_pages_per_minute": None,
+            "ocr_worker_released": False,
+            "ocr_worker_release_seconds": 0.0,
+            "ocr_worker_pids": [],
+            "ocr_worker_shutdown_confirmed": True,
+            "ocr_worker_alive_after_shutdown": [],
             "ocr_target_pages": None,
             "ocr_target_seconds": None,
             "ocr_target_met": None,
+            "ocr_subset_build_seconds": None,
+            "ocr_model_load_seconds": None,
+            "ocr_predict_seconds": None,
+            "ocr_output_materialize_seconds": None,
+            "ocr_payload_convert_seconds": None,
+            "ocr_fragment_collect_seconds": None,
+            "ocr_page_dedupe_seconds": None,
+            "ocr_page_join_seconds": None,
+            "ocr_text_merge_seconds": None,
+            "ocr_merge_seconds": None,
+            "ocr_batch_count": None,
+            "ocr_backend": "",
+            "ocr_backend_attempted": "",
+            "ocr_backend_effective": "",
+            "ocr_backend_fallback_used": False,
+            "ocr_fast_pages": 0,
+            "ocr_vl_pages": 0,
+            "ocr_fast_seconds": 0.0,
+            "ocr_vl_seconds": 0.0,
+            "ocr_fast_avg_score": 0.0,
+            "ocr_fast_pair_ratio": 0.0,
+            "ocr_fast_orphan_ratio": 0.0,
+            "ocr_high_quality_requested": False,
         },
         fallback_parser=fallback_parser,
     )
@@ -146,6 +223,17 @@ def _normalize_pdf_ingest_stats(
         elif ocr_pages:
             parser_name = fallback_parser
     warnings = [str(item).strip() for item in (payload.get("pdf_warnings", []) or []) if str(item).strip()]
+    def _int_list(value: Any) -> List[int]:
+        result: List[int] = []
+        for item in list(value or []):
+            try:
+                parsed = int(item)
+            except (TypeError, ValueError):
+                continue
+            if parsed > 0:
+                result.append(parsed)
+        return sorted(set(result))
+
     return {
         "pdf_parser": parser_name or fallback_parser,
         "pdf_total_pages": max(0, int(payload.get("pdf_total_pages", 0) or 0)),
@@ -161,9 +249,49 @@ def _normalize_pdf_ingest_stats(
         "ocr_elapsed_seconds": payload.get("ocr_elapsed_seconds"),
         "ocr_pages_processed": payload.get("ocr_pages_processed"),
         "ocr_pages_per_minute": payload.get("ocr_pages_per_minute"),
+        "ocr_pages_attempted": payload.get("ocr_pages_attempted"),
+        "ocr_pages_emitted": payload.get("ocr_pages_emitted"),
+        "ocr_pages_skipped_empty": payload.get("ocr_pages_skipped_empty"),
+        "ocr_pages_skipped_short_text": payload.get("ocr_pages_skipped_short_text"),
+        "ocr_attempted_pages_per_minute": payload.get("ocr_attempted_pages_per_minute"),
+        "ocr_emitted_pages_per_minute": payload.get("ocr_emitted_pages_per_minute"),
+        "ocr_worker_released": bool(payload.get("ocr_worker_released", False)),
+        "ocr_worker_release_seconds": float(payload.get("ocr_worker_release_seconds", 0.0) or 0.0),
+        "ocr_worker_pids": _int_list(payload.get("ocr_worker_pids", [])),
+        "ocr_worker_shutdown_confirmed": bool(payload.get("ocr_worker_shutdown_confirmed", True)),
+        "ocr_worker_alive_after_shutdown": _int_list(payload.get("ocr_worker_alive_after_shutdown", [])),
         "ocr_target_pages": payload.get("ocr_target_pages"),
         "ocr_target_seconds": payload.get("ocr_target_seconds"),
         "ocr_target_met": payload.get("ocr_target_met"),
+        "ocr_subset_build_seconds": payload.get("ocr_subset_build_seconds"),
+        "ocr_model_load_seconds": payload.get("ocr_model_load_seconds"),
+        "ocr_predict_seconds": payload.get("ocr_predict_seconds"),
+        "ocr_output_materialize_seconds": payload.get("ocr_output_materialize_seconds"),
+        "ocr_payload_convert_seconds": payload.get("ocr_payload_convert_seconds"),
+        "ocr_fragment_collect_seconds": payload.get("ocr_fragment_collect_seconds"),
+        "ocr_page_dedupe_seconds": payload.get("ocr_page_dedupe_seconds"),
+        "ocr_page_join_seconds": payload.get("ocr_page_join_seconds"),
+        "ocr_text_merge_seconds": payload.get("ocr_text_merge_seconds"),
+        "ocr_merge_seconds": payload.get("ocr_merge_seconds"),
+        "ocr_batch_count": payload.get("ocr_batch_count"),
+        "ocr_backend": str(payload.get("ocr_backend", "") or "").strip(),
+        "ocr_backend_attempted": str(payload.get("ocr_backend_attempted", "") or "").strip(),
+        "ocr_backend_effective": str(payload.get("ocr_backend_effective", "") or "").strip(),
+        "ocr_backend_fallback_used": bool(payload.get("ocr_backend_fallback_used", False)),
+        "ocr_fast_pages": int(payload.get("ocr_fast_pages", 0) or 0),
+        "ocr_vl_pages": int(payload.get("ocr_vl_pages", 0) or 0),
+        "ocr_fast_seconds": float(payload.get("ocr_fast_seconds", 0.0) or 0.0),
+        "ocr_vl_seconds": float(payload.get("ocr_vl_seconds", 0.0) or 0.0),
+        "ocr_fast_avg_score": float(payload.get("ocr_fast_avg_score", 0.0) or 0.0),
+        "ocr_fast_pair_ratio": float(payload.get("ocr_fast_pair_ratio", 0.0) or 0.0),
+        "ocr_fast_orphan_ratio": float(payload.get("ocr_fast_orphan_ratio", 0.0) or 0.0),
+        "ocr_high_quality_requested": bool(payload.get("ocr_high_quality_requested", False)),
+        "chars_before_compaction": int(payload.get("chars_before_compaction", 0) or 0),
+        "chars_after_compaction": int(payload.get("chars_after_compaction", 0) or 0),
+        "lines_before_dedupe": int(payload.get("lines_before_dedupe", 0) or 0),
+        "lines_after_dedupe": int(payload.get("lines_after_dedupe", 0) or 0),
+        "hints_dropped": int(payload.get("hints_dropped", 0) or 0),
+        "chunks_created": int(payload.get("chunks_created", 0) or 0),
     }
 
 
@@ -325,13 +453,305 @@ def delete_kb_dir(kb_id: str, data_dir: str = DEFAULT_KB_DATA_DIR):
         shutil.rmtree(path)
 
 
+def _sql_source_match(column: str, source_paths: List[str]) -> Tuple[str, List[str]]:
+    clauses: List[str] = []
+    params: List[str] = []
+    for source_path in sorted({str(value or "").strip() for value in source_paths if str(value or "").strip()}):
+        escaped_prefix = _source_child_prefix(source_path).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        clauses.append(f"({column} = ? OR {column} LIKE ? ESCAPE '\\')")
+        params.extend((source_path, f"{escaped_prefix}%"))
+    return (" OR ".join(clauses) or "0"), params
+
+
+def _delete_rows_for_ids(
+    conn: sqlite3.Connection,
+    table: str,
+    column: str,
+    values: List[int],
+) -> None:
+    if not values or not _table_exists(conn, table):
+        return
+    placeholders = ",".join("?" for _ in values)
+    conn.execute(
+        f"DELETE FROM {table} WHERE {column} IN ({placeholders})",
+        tuple(int(value) for value in values),
+    )
+
+
+def _delete_source_records(
+    conn: sqlite3.Connection,
+    source_paths: List[str],
+    *,
+    delete_normalized_groups: bool = False,
+) -> Dict[str, Any]:
+    sources = sorted({str(value or "").strip() for value in source_paths if str(value or "").strip()})
+    result: Dict[str, Any] = {
+        "chunk_ids": [],
+        "cache_paths": [],
+        "stored_paths": [],
+        "source_types": [],
+    }
+    if not sources:
+        return result
+
+    source_types: List[str] = []
+    chunk_ids: List[int] = []
+    if _table_exists(conn, "chunks"):
+        chunk_where, chunk_params = _sql_source_match("source_path", sources)
+        chunk_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(chunks)").fetchall()}
+        source_type_sql = "source_type" if "source_type" in chunk_columns else "'' AS source_type"
+        rows = conn.execute(
+            f"SELECT id, {source_type_sql} FROM chunks WHERE {chunk_where}",
+            tuple(chunk_params),
+        ).fetchall()
+        chunk_ids = [int(row[0]) for row in rows if int(row[0] or 0) > 0]
+        source_types = sorted({str(row[1] or "").strip().lower() for row in rows if str(row[1] or "").strip()})
+
+        if delete_normalized_groups and "is_normalized" in chunk_columns:
+            normalized_groups = {
+                "txt" if value in {"txt", "pdf"} else value
+                for value in source_types
+                if value in {"txt", "pdf", "xlsx"}
+            }
+            if normalized_groups and "normalized_group" in chunk_columns:
+                placeholders = ",".join("?" for _ in normalized_groups)
+                normalized_rows = conn.execute(
+                    f"""
+                    SELECT id FROM chunks
+                    WHERE COALESCE(is_normalized, 0) = 1
+                      AND normalized_group IN ({placeholders})
+                    """,
+                    tuple(sorted(normalized_groups)),
+                ).fetchall()
+                chunk_ids.extend(int(row[0]) for row in normalized_rows if int(row[0] or 0) > 0)
+    chunk_ids = sorted(set(chunk_ids))
+    result["chunk_ids"] = chunk_ids
+    result["source_types"] = source_types
+
+    concept_ids: List[int] = []
+    if chunk_ids and _table_exists(conn, "chunk_concept_edges"):
+        placeholders = ",".join("?" for _ in chunk_ids)
+        concept_ids = [
+            int(row[0])
+            for row in conn.execute(
+                f"SELECT DISTINCT concept_id FROM chunk_concept_edges WHERE chunk_pk IN ({placeholders})",
+                tuple(chunk_ids),
+            ).fetchall()
+            if int(row[0] or 0) > 0
+        ]
+        _delete_rows_for_ids(conn, "chunk_concept_edges", "chunk_pk", chunk_ids)
+
+    fact_ids: List[int] = []
+    if _table_exists(conn, "ontology_fact_sources"):
+        fact_conditions: List[str] = []
+        fact_params: List[Any] = []
+        if chunk_ids:
+            placeholders = ",".join("?" for _ in chunk_ids)
+            fact_conditions.append(f"chunk_id IN ({placeholders})")
+            fact_params.extend(chunk_ids)
+        fact_source_where, fact_source_params = _sql_source_match("source_path", sources)
+        fact_conditions.append(f"({fact_source_where})")
+        fact_params.extend(fact_source_params)
+        where_sql = " OR ".join(fact_conditions)
+        fact_ids = [
+            int(row[0])
+            for row in conn.execute(
+                f"SELECT DISTINCT fact_id FROM ontology_fact_sources WHERE {where_sql}",
+                tuple(fact_params),
+            ).fetchall()
+            if int(row[0] or 0) > 0
+        ]
+        conn.execute(
+            f"DELETE FROM ontology_fact_sources WHERE {where_sql}",
+            tuple(fact_params),
+        )
+
+    wiki_page_ids: List[int] = []
+    if _table_exists(conn, "wiki_page_sources"):
+        wiki_conditions: List[str] = []
+        wiki_params: List[Any] = []
+        if chunk_ids:
+            placeholders = ",".join("?" for _ in chunk_ids)
+            wiki_conditions.append(f"chunk_id IN ({placeholders})")
+            wiki_params.extend(chunk_ids)
+        wiki_source_where, wiki_source_params = _sql_source_match("source_path", sources)
+        wiki_conditions.append(f"({wiki_source_where})")
+        wiki_params.extend(wiki_source_params)
+        wiki_where = " OR ".join(wiki_conditions)
+        wiki_page_ids = [
+            int(row[0])
+            for row in conn.execute(
+                f"SELECT DISTINCT page_id FROM wiki_page_sources WHERE {wiki_where}",
+                tuple(wiki_params),
+            ).fetchall()
+            if int(row[0] or 0) > 0
+        ]
+        conn.execute(
+            f"DELETE FROM wiki_page_sources WHERE {wiki_where}",
+            tuple(wiki_params),
+        )
+
+    _delete_rows_for_ids(conn, "chunk_vec", "chunk_pk", chunk_ids)
+    if chunk_ids and _table_exists(conn, "chunk_fts"):
+        placeholders = ",".join("?" for _ in chunk_ids)
+        conn.execute(
+            f"DELETE FROM chunk_fts WHERE rowid IN ({placeholders})",
+            tuple(chunk_ids),
+        )
+    _delete_rows_for_ids(conn, "chunks", "id", chunk_ids)
+
+    if concept_ids and _table_exists(conn, "concept_nodes"):
+        placeholders = ",".join("?" for _ in concept_ids)
+        conn.execute(
+            f"""
+            DELETE FROM concept_nodes
+            WHERE concept_id IN ({placeholders})
+              AND NOT EXISTS (
+                  SELECT 1 FROM chunk_concept_edges edge
+                  WHERE edge.concept_id = concept_nodes.concept_id
+              )
+            """,
+            tuple(concept_ids),
+        )
+
+    if fact_ids and _table_exists(conn, "ontology_facts"):
+        placeholders = ",".join("?" for _ in fact_ids)
+        orphan_fact_ids = [
+            int(row[0])
+            for row in conn.execute(
+                f"""
+                SELECT fact_id FROM ontology_facts
+                WHERE fact_id IN ({placeholders})
+                  AND NOT EXISTS (
+                      SELECT 1 FROM ontology_fact_sources source
+                      WHERE source.fact_id = ontology_facts.fact_id
+                  )
+                """,
+                tuple(fact_ids),
+            ).fetchall()
+        ]
+        _delete_rows_for_ids(conn, "ontology_fact_feedback", "fact_id", orphan_fact_ids)
+        _delete_rows_for_ids(conn, "ontology_fact_history", "fact_id", orphan_fact_ids)
+        _delete_rows_for_ids(conn, "ontology_facts", "fact_id", orphan_fact_ids)
+
+    if wiki_page_ids and _table_exists(conn, "wiki_pages"):
+        placeholders = ",".join("?" for _ in wiki_page_ids)
+        orphan_source_page_ids = [
+            int(row[0])
+            for row in conn.execute(
+                f"""
+                SELECT page_id FROM wiki_pages
+                WHERE page_id IN ({placeholders})
+                  AND page_type = 'source'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM wiki_page_sources source
+                      WHERE source.page_id = wiki_pages.page_id
+                  )
+                """,
+                tuple(wiki_page_ids),
+            ).fetchall()
+        ]
+        _delete_rows_for_ids(conn, "wiki_links", "from_page_id", orphan_source_page_ids)
+        _delete_rows_for_ids(conn, "wiki_claims", "page_id", orphan_source_page_ids)
+        _delete_rows_for_ids(conn, "wiki_update_log", "page_id", orphan_source_page_ids)
+        _delete_rows_for_ids(conn, "wiki_lint_findings", "page_id", orphan_source_page_ids)
+        _delete_rows_for_ids(conn, "wiki_pages", "page_id", orphan_source_page_ids)
+
+    if _table_exists(conn, "documents"):
+        doc_where, doc_params = _sql_source_match("source_path", sources)
+        doc_ids = [
+            str(row[0])
+            for row in conn.execute(
+                f"SELECT doc_id FROM documents WHERE {doc_where}",
+                tuple(doc_params),
+            ).fetchall()
+            if str(row[0] or "")
+        ]
+        if doc_ids:
+            placeholders = ",".join("?" for _ in doc_ids)
+            if _table_exists(conn, "doc_blocks"):
+                conn.execute(f"DELETE FROM doc_blocks WHERE doc_id IN ({placeholders})", tuple(doc_ids))
+            if _table_exists(conn, "doc_table_cells"):
+                conn.execute(f"DELETE FROM doc_table_cells WHERE doc_id IN ({placeholders})", tuple(doc_ids))
+        conn.execute(f"DELETE FROM documents WHERE {doc_where}", tuple(doc_params))
+
+    if _table_exists(conn, "source_uploads"):
+        upload_where, upload_params = _sql_source_match("source_path", sources)
+        conn.execute(f"DELETE FROM source_uploads WHERE {upload_where}", tuple(upload_params))
+
+    if _table_exists(conn, "file_cache"):
+        cache_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(file_cache)").fetchall()}
+        cache_path_columns = [
+            value
+            for value in (
+                "items_cache_path",
+                "embeddings_cache_path",
+                "emb_small_cache_path",
+                "emb_large_cache_path",
+            )
+            if value in cache_columns
+        ]
+        cache_where, cache_params = _sql_source_match("source_path", sources)
+        if cache_path_columns:
+            cache_rows = conn.execute(
+                f"SELECT {', '.join(cache_path_columns)} FROM file_cache WHERE {cache_where}",
+                tuple(cache_params),
+            ).fetchall()
+            result["cache_paths"] = sorted(
+                {
+                    str(value or "").strip()
+                    for row in cache_rows
+                    for value in row
+                    if str(value or "").strip()
+                }
+            )
+        conn.execute(f"DELETE FROM file_cache WHERE {cache_where}", tuple(cache_params))
+
+    if _table_exists(conn, "files"):
+        file_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(files)").fetchall()}
+        file_where, file_params = _sql_source_match("source_path", sources)
+        if "stored_path" in file_columns:
+            result["stored_paths"] = sorted(
+                {
+                    str(row[0] or "").strip()
+                    for row in conn.execute(
+                        f"SELECT stored_path FROM files WHERE {file_where}",
+                        tuple(file_params),
+                    ).fetchall()
+                    if str(row[0] or "").strip()
+                }
+            )
+        conn.execute(f"DELETE FROM files WHERE {file_where}", tuple(file_params))
+    return result
+
+
+def _remove_managed_file(path: str, allowed_roots: List[str]) -> bool:
+    candidate = str(path or "").strip()
+    if not candidate:
+        return False
+    resolved = os.path.realpath(os.path.abspath(candidate))
+    allowed = False
+    for root in allowed_roots:
+        resolved_root = os.path.realpath(os.path.abspath(root))
+        try:
+            if os.path.commonpath([resolved, resolved_root]) == resolved_root:
+                allowed = True
+                break
+        except ValueError:
+            continue
+    if not allowed or not os.path.isfile(resolved):
+        return False
+    os.remove(resolved)
+    return True
+
+
 def delete_file_from_kb(kb_id: str, file_key: str, data_dir: str = DEFAULT_KB_DATA_DIR):
     """Delete a file from KB uploads using file_id or stored filename."""
     uploads_dir = os.path.join(data_dir, kb_id, "uploads")
+    cache_dir = os.path.join(data_dir, kb_id, "cache")
     db_path = _kb_meta_db_path(kb_id, data_dir)
     stored_path = os.path.join(uploads_dir, file_key)
     source_path = ""
-    target_file_id = ""
 
     if os.path.exists(db_path):
         conn = _connect_meta_db(db_path)
@@ -355,83 +775,35 @@ def delete_file_from_kb(kb_id: str, file_key: str, data_dir: str = DEFAULT_KB_DA
                             row = candidate
                             break
                 if row is not None:
-                    target_file_id = str(row["file_id"] or "")
                     source_path = str(row["source_path"] or "")
                     candidate_stored_path = str(row["stored_path"] or "")
                     if candidate_stored_path:
                         stored_path = candidate_stored_path
 
-            if stored_path and os.path.exists(stored_path):
-                os.remove(stored_path)
-
             if source_path:
-                like_prefix = f"{_source_child_prefix(source_path)}%"
-                doc_ids: List[str] = []
-                if _table_exists(conn, "documents"):
-                    doc_rows = conn.execute(
-                        "SELECT doc_id FROM documents WHERE source_path = ? OR source_path LIKE ?",
-                        (source_path, like_prefix),
-                    ).fetchall()
-                    doc_ids = [str(row["doc_id"]) for row in doc_rows if row["doc_id"]]
-                chunk_ids: List[int] = []
-                if _table_exists(conn, "chunks"):
-                    chunk_rows = conn.execute(
-                        """
-                        SELECT id
-                        FROM chunks
-                        WHERE source_path = ? OR source_path LIKE ?
-                        """,
-                        (source_path, like_prefix),
-                    ).fetchall()
-                    chunk_ids = [int(row["id"]) for row in chunk_rows if row["id"]]
-                if chunk_ids and _table_exists(conn, "chunk_vec"):
-                    placeholders = ",".join("?" for _ in chunk_ids)
-                    conn.execute(
-                        f"DELETE FROM chunk_vec WHERE chunk_pk IN ({placeholders})",
-                        tuple(chunk_ids),
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    cleanup = _delete_source_records(
+                        conn,
+                        [source_path],
+                        delete_normalized_groups=True,
                     )
-                if _table_exists(conn, "chunks"):
-                    conn.execute(
-                        "DELETE FROM chunks WHERE source_path = ? OR source_path LIKE ?",
-                        (source_path, like_prefix),
-                    )
-                if _table_exists(conn, "source_uploads"):
-                    conn.execute(
-                        "DELETE FROM source_uploads WHERE source_path = ? OR source_path LIKE ?",
-                        (source_path, like_prefix),
-                    )
-                if doc_ids and _table_exists(conn, "doc_blocks"):
-                    placeholders = ",".join("?" for _ in doc_ids)
-                    conn.execute(
-                        f"DELETE FROM doc_blocks WHERE doc_id IN ({placeholders})",
-                        tuple(doc_ids),
-                    )
-                if doc_ids and _table_exists(conn, "doc_table_cells"):
-                    placeholders = ",".join("?" for _ in doc_ids)
-                    conn.execute(
-                        f"DELETE FROM doc_table_cells WHERE doc_id IN ({placeholders})",
-                        tuple(doc_ids),
-                    )
-                if _table_exists(conn, "documents"):
-                    conn.execute(
-                        "DELETE FROM documents WHERE source_path = ? OR source_path LIKE ?",
-                        (source_path, like_prefix),
-                    )
-                if _table_exists(conn, "files"):
-                    if target_file_id:
-                        conn.execute("DELETE FROM files WHERE file_id = ?", (target_file_id,))
-                    else:
-                        conn.execute(
-                            "DELETE FROM files WHERE source_path = ? OR source_path LIKE ?",
-                            (source_path, like_prefix),
-                        )
-                conn.commit()
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+                for candidate in [
+                    *list(cleanup.get("stored_paths", []) or []),
+                    stored_path,
+                ]:
+                    _remove_managed_file(candidate, [uploads_dir])
+                for candidate in list(cleanup.get("cache_paths", []) or []):
+                    _remove_managed_file(candidate, [cache_dir])
                 return
         finally:
             conn.close()
 
-    if os.path.exists(stored_path):
-        os.remove(stored_path)
+    _remove_managed_file(stored_path, [uploads_dir])
 
 
 class RAGEngine:
@@ -467,6 +839,16 @@ class RAGEngine:
         self.pdf_target_tokens = int(os.getenv("PDF_CHUNK_TARGET_TOKENS", str(self.txt_target_tokens)))
         self.pdf_min_tokens = int(os.getenv("PDF_CHUNK_MIN_TOKENS", str(self.txt_min_tokens)))
         self.pdf_max_tokens = int(os.getenv("PDF_CHUNK_MAX_TOKENS", str(self.txt_max_tokens)))
+        self.pdf_target_tokens_real = int(os.getenv("PDF_CHUNK_TARGET_TOKENS_REAL", "480"))
+        self.pdf_max_tokens_real = int(os.getenv("PDF_CHUNK_MAX_TOKENS_REAL", "640"))
+        self.txt_target_tokens_real = int(os.getenv("TXT_CHUNK_TARGET_TOKENS_REAL", str(self.txt_target_tokens)))
+        self.txt_max_tokens_real = int(os.getenv("TXT_CHUNK_MAX_TOKENS_REAL", str(self.txt_max_tokens)))
+        self.hwpx_target_tokens_real = int(os.getenv("HWPX_CHUNK_TARGET_TOKENS_REAL", "220"))
+        self.hwpx_max_tokens_real = int(os.getenv("HWPX_CHUNK_MAX_TOKENS_REAL", "320"))
+        self.embedding_compaction_enabled = _env_bool("EMBEDDING_COMPACTION_ENABLED", True)
+        self.embedding_compaction_min_line_chars = max(1, int(os.getenv("EMBEDDING_COMPACTION_MIN_LINE_CHARS", "3")))
+        self.embedding_compaction_max_hint_lines = max(0, int(os.getenv("EMBEDDING_COMPACTION_MAX_HINT_LINES", "2")))
+        self.embedding_compaction_max_chunk_chars = max(400, int(os.getenv("EMBEDDING_COMPACTION_MAX_CHUNK_CHARS", "1800")))
         self.hwpx_extract_enabled = _env_bool("HWPX_EXTRACT_ENABLED", True)
         self.hwpx_include_tables = _env_bool("HWPX_INCLUDE_TABLES", True)
         self.hwpx_target_tokens = int(os.getenv("HWPX_CHUNK_TARGET_TOKENS", "220"))
@@ -538,6 +920,7 @@ class RAGEngine:
         self.embedding_api_key = os.getenv("EMBEDDING_API_KEY", "").strip()
         self.embedding_timeout = float(os.getenv("EMBEDDING_TIMEOUT", "60"))
         self.embedding_api_batch_size = max(1, int(os.getenv("EMBEDDING_API_BATCH_SIZE", "16")))
+        self.embedding_max_batch_tokens = max(256, int(os.getenv("EMBED_MAX_BATCH_TOKENS", "8192")))
         self.embedding_api_large_alias = os.getenv("EMBEDDING_API_LARGE_ALIAS", "large").strip() or "large"
         self.embedding_task_prefix_mode_raw = (
             os.getenv("EMBEDDING_TASK_PREFIX_MODE", "auto").strip().lower() or "auto"
@@ -558,12 +941,21 @@ class RAGEngine:
             ),
         )
         self.sqlite_journal_mode = (os.getenv("RAG_SQLITE_JOURNAL_MODE", "WAL") or "WAL").strip().upper()
+        self.log_retention_days = max(1, int(os.getenv("RAG_LOG_RETENTION_DAYS", "30")))
+        self.log_retention_max_rows = max(100, int(os.getenv("RAG_LOG_RETENTION_MAX_ROWS", "50000")))
+        self.log_prune_interval_seconds = max(
+            60,
+            int(os.getenv("RAG_LOG_PRUNE_INTERVAL_SECONDS", "3600")),
+        )
+        self.log_prune_batch_size = max(100, int(os.getenv("RAG_LOG_PRUNE_BATCH_SIZE", "2000")))
+        self._last_log_prune_at = 0
         self.embedding_task_prefix_mode = self._resolve_task_prefix_mode(
             model_ref=self.embedding_model_ref,
             requested_mode=self.embedding_task_prefix_mode_raw,
         )
 
         self._init_db()
+        self._prune_operational_logs_if_due(force=True)
 
         self.model_large: Optional[SentenceTransformer] = None
 
@@ -667,7 +1059,7 @@ class RAGEngine:
         raise RuntimeError(f"Could not load embedding model ({tag}).")
 
     def _infer_embedding_dim(self, model: SentenceTransformer) -> int:
-        probe_text = self._apply_task_prefix("임베딩 차원 확인", task="passage")
+        probe_text = self._apply_task_prefix(EMBEDDING_DIMENSION_PROBE_TEXT, task="passage")
         probe = self._encode_texts_local(model, [probe_text], task="passage")
         arr = np.asarray(probe)
         if arr.ndim == 1:
@@ -779,7 +1171,7 @@ class RAGEngine:
 
     def _infer_remote_embedding_dim(self, index_name: str) -> int:
         probe = self._encode_texts_api(
-            texts=["임베딩 차원 확인"],
+            texts=[EMBEDDING_DIMENSION_PROBE_TEXT],
             task="passage",
             index_name=index_name,
             expected_dim=None,
@@ -901,6 +1293,225 @@ class RAGEngine:
         model = self.model_large
         prefixed = [self._apply_task_prefix(t, task=task) for t in texts]
         return self._encode_texts_local(model, prefixed, task=task)
+
+    def _model_tokenizer(self, model: Optional[SentenceTransformer]):
+        if model is None:
+            return None
+        tokenizer = getattr(model, "tokenizer", None)
+        if tokenizer is not None:
+            return tokenizer
+        first_module = None
+        try:
+            modules = getattr(model, "_modules", None)
+            if modules:
+                first_module = next(iter(modules.values()))
+        except Exception:
+            first_module = None
+        tokenizer = getattr(first_module, "tokenizer", None)
+        if tokenizer is not None:
+            return tokenizer
+        first_module_getter = getattr(model, "_first_module", None)
+        if callable(first_module_getter):
+            try:
+                first_module = first_module_getter()
+            except Exception:
+                first_module = None
+            tokenizer = getattr(first_module, "tokenizer", None)
+            if tokenizer is not None:
+                return tokenizer
+        return None
+
+    def _tokenize_lengths_api(self, texts: List[str], task: str, index_name: str = "large") -> List[int]:
+        url = f"{self.embedding_api_url}/tokenize_lengths"
+        alias = self._remote_index_alias(index_name)
+        try:
+            resp = requests.post(
+                url,
+                json={"texts": texts, "task": task, "index_name": alias},
+                headers=self._api_headers(),
+                timeout=self.embedding_timeout,
+            )
+        except requests.RequestException as e:
+            raise RuntimeError(f"Embedding tokenize_lengths request failed: {e}") from e
+        if resp.status_code == 401:
+            raise RuntimeError("Embedding API unauthorized (check EMBEDDING_API_KEY).")
+        if resp.status_code >= 400:
+            raise RuntimeError(f"Embedding tokenize_lengths error {resp.status_code}: {resp.text[:300]}")
+        data = resp.json()
+        lengths = data.get("lengths")
+        if not isinstance(lengths, list):
+            raise RuntimeError("Embedding tokenize_lengths response missing 'lengths'.")
+        return [max(1, int(value or 0)) for value in lengths]
+
+    def _tokenize_lengths_local(
+        self,
+        texts: List[str],
+        task: str,
+        index_name: str = "large",
+    ) -> List[int]:
+        index_key = self._normalize_index_name(index_name)
+        if index_key != "large":
+            raise ValueError(f"Unsupported embedding index: {index_name}")
+        model = self.model_large
+        tokenizer = self._model_tokenizer(model)
+        if model is None or tokenizer is None:
+            return [max(1, len(_OVERLAP_TERM_RE.findall(str(text or "")))) for text in texts]
+        prefixed = [self._apply_task_prefix((text or ""), task=task) for text in texts]
+        encoded = tokenizer(prefixed, add_special_tokens=True, truncation=False, padding=False)
+        input_ids = encoded.get("input_ids") if isinstance(encoded, dict) else None
+        if not isinstance(input_ids, list):
+            return [max(1, len(_OVERLAP_TERM_RE.findall(str(text or "")))) for text in texts]
+        return [max(1, int(len(ids or []))) for ids in input_ids]
+
+    def _measure_text_token_lengths(
+        self,
+        texts: List[str],
+        *,
+        task: str,
+        index_name: str = "large",
+    ) -> List[int]:
+        if not texts:
+            return []
+        try:
+            if self._is_api_provider():
+                return self._tokenize_lengths_api(texts, task=task, index_name=index_name)
+            return self._tokenize_lengths_local(texts, task=task, index_name=index_name)
+        except Exception:
+            return [max(1, len(_OVERLAP_TERM_RE.findall(str(text or "")))) for text in texts]
+
+    def _compact_pdf_embedding_payload(
+        self,
+        page_text: str,
+        table_hints: List[str],
+        lazy_ocr_hints: List[str],
+    ) -> Tuple[List[str], Dict[str, int]]:
+        min_line_chars = max(1, int(getattr(self, "embedding_compaction_min_line_chars", 3) or 3))
+        max_hint_lines = max(0, int(getattr(self, "embedding_compaction_max_hint_lines", 2) or 2))
+        max_chunk_chars = max(400, int(getattr(self, "embedding_compaction_max_chunk_chars", 1800) or 1800))
+        raw_lines = [
+            re.sub(r"\s+", " ", (line or "").strip())
+            for line in str(page_text or "").splitlines()
+        ]
+        hint_lines = [
+            re.sub(r"\s+", " ", (hint or "").strip())
+            for hint in [*list(table_hints or []), *list(lazy_ocr_hints or [])]
+        ]
+        chars_before = sum(len(line) for line in raw_lines) + sum(len(line) for line in hint_lines)
+        lines_before = len([line for line in raw_lines if line]) + len([line for line in hint_lines if line])
+        seen: "OrderedDict[str, None]" = OrderedDict()
+        compact_lines: List[str] = []
+        max_line_chars = max(120, min(max_chunk_chars, 480))
+
+        def _line_segments(value: str) -> List[str]:
+            normalized = re.sub(r"\s+", " ", (value or "").strip())
+            if len(normalized) <= max_line_chars:
+                return [normalized]
+            sentence_parts = [part.strip() for part in _SENTENCE_SPLIT_RE.split(normalized) if part.strip()]
+            if not sentence_parts:
+                sentence_parts = [normalized]
+            chunks: List[str] = []
+            current = ""
+            for part in sentence_parts:
+                candidate = part if not current else f"{current} {part}"
+                if current and len(candidate) > max_line_chars:
+                    chunks.append(current)
+                    current = part
+                else:
+                    current = candidate
+            if current:
+                chunks.append(current)
+            split_chunks: List[str] = []
+            for chunk in chunks or [normalized]:
+                if len(chunk) <= max_line_chars:
+                    split_chunks.append(chunk)
+                    continue
+                for start in range(0, len(chunk), max_line_chars):
+                    split_chunks.append(chunk[start : start + max_line_chars].strip())
+            return [chunk for chunk in split_chunks if chunk]
+
+        def _keep_line(value: str, *, is_hint: bool = False) -> None:
+            normalized = re.sub(r"\s+", " ", (value or "").strip())
+            if not normalized:
+                return
+            for segment in _line_segments(normalized):
+                if len(segment) < min_line_chars:
+                    continue
+                lowered = segment.lower()
+                if lowered in seen:
+                    continue
+                if re.fullmatch(r"page\s*\d+(\s*of\s*\d+)?", lowered) or re.fullmatch(r"\d+\s*/\s*\d+", lowered):
+                    continue
+                seen[lowered] = None
+                compact_lines.append(segment)
+
+        for raw_line in raw_lines:
+            _keep_line(raw_line, is_hint=False)
+        kept_hints = 0
+        for hint_line in hint_lines:
+            if kept_hints >= max_hint_lines:
+                break
+            before_len = len(compact_lines)
+            _keep_line(hint_line, is_hint=True)
+            if len(compact_lines) > before_len:
+                kept_hints += 1
+
+        chars_after = sum(len(line) for line in compact_lines)
+        return compact_lines, {
+            "chars_before_compaction": chars_before,
+            "chars_after_compaction": chars_after,
+            "lines_before_dedupe": lines_before,
+            "lines_after_dedupe": len(compact_lines),
+            "hints_dropped": max(0, len([line for line in hint_lines if line]) - kept_hints),
+        }
+
+    def _split_lines_for_real_token_budget(
+        self,
+        lines: List[Dict[str, Any]],
+        *,
+        target_tokens: int,
+        min_tokens: int,
+        max_tokens: int,
+        task: str = "passage",
+    ) -> List[Dict[str, Any]]:
+        if not lines:
+            return []
+        measured_lengths = self._measure_text_token_lengths(
+            [str(item.get("text", "") or "") for item in lines],
+            task=task,
+            index_name="large",
+        )
+        return chunk_txt_items(
+            lines,
+            target_tokens=target_tokens,
+            min_tokens=min_tokens,
+            max_tokens=max_tokens,
+            overlap_ratio=self.txt_overlap_ratio,
+            measured_lengths=measured_lengths,
+        )
+
+    def _token_budget_batches(
+        self,
+        rows: List[sqlite3.Row],
+    ) -> List[List[sqlite3.Row]]:
+        if not rows:
+            return []
+        texts = [str(row["embedding_text"] or row["text"] or "") for row in rows]
+        lengths = self._measure_text_token_lengths(texts, task="passage", index_name="large")
+        max_rows = self.embedding_api_batch_size if self.embedding_provider == "api" else self.embed_batch_size
+        batches: List[List[sqlite3.Row]] = []
+        current_batch: List[sqlite3.Row] = []
+        current_tokens = 0
+        for row, token_len in zip(rows, lengths):
+            bounded = max(1, int(token_len or 0))
+            if current_batch and (len(current_batch) >= max_rows or current_tokens + bounded > self.embedding_max_batch_tokens):
+                batches.append(current_batch)
+                current_batch = []
+                current_tokens = 0
+            current_batch.append(row)
+            current_tokens += bounded
+        if current_batch:
+            batches.append(current_batch)
+        return batches
 
     def _init_db(self):
         conn = self._connect_db()
@@ -1283,39 +1894,127 @@ class RAGEngine:
         conn.commit()
         conn.close()
 
-    def _upsert_chunk_vectors_for_rows(self, rows: List[sqlite3.Row], index_name: str = "large"):
+    def _upsert_chunk_vectors_for_rows(
+        self,
+        rows: List[sqlite3.Row],
+        index_name: str = "large",
+        *,
+        progress_callback: Optional[Callable[..., None]] = None,
+        log_context: Optional[Dict[str, Any]] = None,
+    ):
         if (not self.sqlite_dense_enabled) or (not rows):
             return
-        texts = [row["embedding_text"] or row["text"] or "" for row in rows]
-        embeddings = self._encode_texts(index_name=index_name, texts=texts, task="passage")
-        now_ts = int(time.time())
-        payload = []
-        for row, vec in zip(rows, embeddings):
-            arr = np.asarray(vec, dtype=np.float32)
-            payload.append(
-                (
-                    int(row["id"]),
-                    index_name,
-                    int(arr.shape[0]),
-                    sqlite3.Binary(arr.tobytes()),
-                    now_ts,
-                )
-            )
+        total_rows = len(rows)
+        texts_all = [str(row["embedding_text"] or row["text"] or "") for row in rows]
+        measured_lengths = self._measure_text_token_lengths(texts_all, task="passage", index_name=index_name)
+        max_rows = self.embedding_api_batch_size if self.embedding_provider == "api" else self.embed_batch_size
+        batches: List[Tuple[List[sqlite3.Row], List[int]]] = []
+        current_rows: List[sqlite3.Row] = []
+        current_lengths: List[int] = []
+        current_tokens = 0
+        for row, token_len in zip(rows, measured_lengths):
+            bounded_len = max(1, int(token_len or 0))
+            if current_rows and (len(current_rows) >= max_rows or current_tokens + bounded_len > self.embedding_max_batch_tokens):
+                batches.append((current_rows, current_lengths))
+                current_rows = []
+                current_lengths = []
+                current_tokens = 0
+            current_rows.append(row)
+            current_lengths.append(bounded_len)
+            current_tokens += bounded_len
+        if current_rows:
+            batches.append((current_rows, current_lengths))
+        total_batches = max(1, len(batches))
+        source_path = str((log_context or {}).get("source_path", "") or "")
+        job_id = str((log_context or {}).get("job_id", "") or "")
+        rows_done = 0
+        tokens_done = 0
+        total_input_tokens = int(sum(measured_lengths))
+        measured_lengths_sorted = sorted(int(value) for value in measured_lengths)
+        p95_index = max(0, min(len(measured_lengths_sorted) - 1, math.ceil(len(measured_lengths_sorted) * 0.95) - 1))
         conn = self._connect_db()
         c = conn.cursor()
-        c.executemany(
-            """
-            INSERT INTO chunk_vec (chunk_pk, index_name, dim, embedding, updated_at)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(chunk_pk, index_name) DO UPDATE SET
-                dim = excluded.dim,
-                embedding = excluded.embedding,
-                updated_at = excluded.updated_at
-            """,
-            payload,
-        )
-        conn.commit()
-        conn.close()
+        try:
+            for batch_index, (batch_rows, batch_lengths) in enumerate(batches, start=1):
+                texts = [row["embedding_text"] or row["text"] or "" for row in batch_rows]
+                batch_tokens = int(sum(batch_lengths))
+                batch_started = time.perf_counter()
+                if callable(progress_callback):
+                    try:
+                        progress_callback(
+                            batch_index,
+                            total_batches,
+                            rows_done,
+                            embed_input_tokens_total=total_input_tokens,
+                            embed_input_tokens_done=tokens_done,
+                            embed_input_tokens_p95=int(measured_lengths_sorted[p95_index] if measured_lengths_sorted else 0),
+                            embed_input_tokens_max=int(max(measured_lengths) if measured_lengths else 0),
+                            embed_truncated_rows=0,
+                            embed_effective_batch_tokens=batch_tokens,
+                        )
+                    except TypeError:
+                        progress_callback(batch_index, total_batches, rows_done)
+                print(
+                    "[UPLOAD][PHASE] stage=embed_chunks status=batch_start "
+                    f"job_id={job_id or '-'} source_path={source_path or '-'} "
+                    f"batch={batch_index}/{total_batches} rows={len(batch_rows)} rows_done={rows_done}/{total_rows} "
+                    f"batch_input_tokens={batch_tokens} batch_max_tokens={self.embedding_max_batch_tokens}",
+                    flush=True,
+                )
+                embeddings = self._encode_texts(index_name=index_name, texts=texts, task="passage")
+                now_ts = int(time.time())
+                payload = []
+                for row, vec in zip(batch_rows, embeddings):
+                    arr = np.asarray(vec, dtype=np.float32)
+                    payload.append(
+                        (
+                            int(row["id"]),
+                            index_name,
+                            int(arr.shape[0]),
+                            sqlite3.Binary(arr.tobytes()),
+                            now_ts,
+                        )
+                    )
+                c.executemany(
+                    """
+                    INSERT INTO chunk_vec (chunk_pk, index_name, dim, embedding, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(chunk_pk, index_name) DO UPDATE SET
+                        dim = excluded.dim,
+                        embedding = excluded.embedding,
+                        updated_at = excluded.updated_at
+                    """,
+                    payload,
+                )
+                conn.commit()
+                rows_done += len(batch_rows)
+                tokens_done += batch_tokens
+                batch_seconds = max(0.0, time.perf_counter() - batch_started)
+                print(
+                    "[UPLOAD][PHASE] stage=embed_chunks status=batch_done "
+                    f"job_id={job_id or '-'} source_path={source_path or '-'} "
+                    f"batch={batch_index}/{total_batches} embed_batch_rows={len(batch_rows)} "
+                    f"rows_done={rows_done}/{total_rows} embed_batch_seconds={batch_seconds:.3f} "
+                    f"embed_batch_tokens={batch_tokens} embed_tokens_done={tokens_done}/{total_input_tokens}",
+                    flush=True,
+                )
+                if callable(progress_callback):
+                    try:
+                        progress_callback(
+                            batch_index,
+                            total_batches,
+                            rows_done,
+                            embed_input_tokens_total=total_input_tokens,
+                            embed_input_tokens_done=tokens_done,
+                            embed_input_tokens_p95=int(measured_lengths_sorted[p95_index] if measured_lengths_sorted else 0),
+                            embed_input_tokens_max=int(max(measured_lengths) if measured_lengths else 0),
+                            embed_truncated_rows=0,
+                            embed_effective_batch_tokens=batch_tokens,
+                        )
+                    except TypeError:
+                        progress_callback(batch_index, total_batches, rows_done)
+        finally:
+            conn.close()
 
     def _upsert_fts_rows_for_rows(self, rows: List[sqlite3.Row]):
         if (not getattr(self, "fts_available", False)) or (not rows):
@@ -1364,6 +2063,8 @@ class RAGEngine:
         changed_chunk_ids: Optional[List[int]] = None,
         deleted_chunk_ids: Optional[List[int]] = None,
         index_name: str = "large",
+        vector_progress_callback: Optional[Callable[[int, int, int], None]] = None,
+        vector_log_context: Optional[Dict[str, Any]] = None,
     ):
         deleted_ids = [int(chunk_id) for chunk_id in (deleted_chunk_ids or []) if int(chunk_id) > 0]
         changed_ids = [int(chunk_id) for chunk_id in (changed_chunk_ids or []) if int(chunk_id) > 0]
@@ -1377,7 +2078,12 @@ class RAGEngine:
         if skipped_ids:
             self._delete_search_artifacts_for_chunk_ids(skipped_ids, index_name=index_name)
         if rows:
-            self._upsert_chunk_vectors_for_rows(rows, index_name=index_name)
+            self._upsert_chunk_vectors_for_rows(
+                rows,
+                index_name=index_name,
+                progress_callback=vector_progress_callback,
+                log_context=vector_log_context,
+            )
             self._upsert_fts_rows_for_rows(rows)
 
     def _normalize_concept_key(self, text: str) -> str:
@@ -1386,30 +2092,16 @@ class RAGEngine:
 
     def _concept_stopwords(self) -> set[str]:
         return {
-            "합니다",
-            "안내",
-            "설명",
-            "기준",
-            "절차",
-            "대상",
-            "자료",
-            "관련",
-            "내용",
-            "정리",
-            "문의",
-            "경우",
-            "파일",
-            "문서",
-            "업로드",
-            "지원금",
-            "합니다",
-            "대한",
-            "에서",
-            "으로",
-            "그리고",
-            "또는",
-            "해야",
-            "해당",
+            "guide",
+            "manual",
+            "summary",
+            "question",
+            "answer",
+            "document",
+            "file",
+            "upload",
+            "content",
+            "info",
         }
 
     def _extract_concept_terms(self, text: str) -> List[str]:
@@ -2372,19 +3064,22 @@ class RAGEngine:
             large_sig = os.getenv("EMBEDDING_MODEL_LARGE_PATH", DEFAULT_EMBEDDING_MODEL_LARGE_PATH)
             provider_sig = f"local:{large_sig}"
         return (
-            "v18-structure-rag-v2"
+            "v20-ppocr-fast-v1"
             f"|txt={self.txt_target_tokens}:{self.txt_min_tokens}:{self.txt_max_tokens}:{self.txt_overlap_ratio}"
+            f"|txtreal={self.txt_target_tokens_real}:{self.txt_max_tokens_real}"
             f"|txtsplit={int(self.txt_split_enabled)}:{self.txt_split_trigger_lines}:{self.txt_split_target_tokens}:{self.txt_split_min_tokens}:{self.txt_split_max_tokens}"
             f"|pdf={self.pdf_target_tokens}:{self.pdf_min_tokens}:{self.pdf_max_tokens}"
-            f"|pdfocr={os.getenv('PDF_OCR_MODEL_NAME', 'PaddleOCR-VL-1.5')}:{os.getenv('PDF_OCR_MAX_PAGES', '240')}"
+            f"|pdfreal={self.pdf_target_tokens_real}:{self.pdf_max_tokens_real}:{int(self.embedding_compaction_enabled)}:{self.embedding_compaction_min_line_chars}:{self.embedding_compaction_max_hint_lines}:{self.embedding_compaction_max_chunk_chars}"
+            f"|pdfocr={os.getenv('PDF_OCR_BACKEND', 'ppocr_fast_v1')}:{os.getenv('PDF_OCR_MODEL_NAME', 'PaddleOCR-VL-1.5')}:{os.getenv('PDF_OCR_MAX_PAGES', '240')}:{os.getenv('PDF_OCR_FAST_LANG', 'korean')}:{os.getenv('PDF_OCR_FAST_VL_FALLBACK', '0')}"
             f"|pdfparse={os.getenv('PDF_PARSE_MODE', 'hybrid')}:{os.getenv('PDF_TEXT_EXTRACTOR', 'pymupdf')}:{os.getenv('PDF_TEXT_MIN_CHARS', os.getenv('PDF_OCR_MIN_TEXT_CHARS', '4'))}:{os.getenv('PDF_TEXT_MIN_NONSPACE_RATIO', '0.20')}:{int(_env_bool('PDF_UPLOAD_OCR_ENABLED', False))}:lazyhintv1"
             f"|xlsx={self.xlsx_group_min_rows}:{self.xlsx_group_max_rows}:{self.xlsx_overlap_rows}:{self.xlsx_target_tokens}:{self.xlsx_max_tokens}"
-            f"|hwpx={int(self.hwpx_extract_enabled)}:{int(self.hwpx_include_tables)}:{self.hwpx_target_tokens}:{self.hwpx_min_tokens}:{self.hwpx_max_tokens}:{self.hwpx_overlap_ratio}:python-hwpx-2.9-line-v4-generic-alias"
+            f"|hwpx={int(self.hwpx_extract_enabled)}:{int(self.hwpx_include_tables)}:{self.hwpx_target_tokens}:{self.hwpx_min_tokens}:{self.hwpx_max_tokens}:{self.hwpx_overlap_ratio}:{self.hwpx_target_tokens_real}:{self.hwpx_max_tokens_real}:python-hwpx-2.9-line-v4-generic-alias"
             f"|structurev2={int(self.structure_rag_v2_enabled)}:{int(self.hwpx_structure_rag_v2_enabled)}:{int(self.xlsx_structure_rag_v2_enabled)}"
             f"|policy={self.xlsx_merged_cell_policy}:{self.xlsx_comment_policy}"
             f"|xlsxguard={os.getenv('XLSX_MAX_SHEETS', '20')}:{os.getenv('XLSX_MAX_ROWS', '50000')}:{os.getenv('XLSX_MAX_COLS', '200')}:{os.getenv('XLSX_PARSE_TIMEOUT_SEC', '25')}"
             f"|embed={provider_sig}"
             f"|embedprefix={self.embedding_task_prefix_mode}:{hashlib.sha1(self.embedding_qwen_query_instruction.encode('utf-8')).hexdigest()[:8]}"
+            f"|embedbudget={self.embedding_max_batch_tokens}:{os.getenv('EMBED_MAX_QUERY_TOKENS', '384')}:{os.getenv('EMBED_MAX_PASSAGE_TOKENS', '768')}"
             f"|dim={self.dim_large}"
             f"|indexmix={int(self.index_include_raw_with_normalized)}:{self.normalized_score_penalty}:{self.code_match_boost}:{self.code_hint_boost_ratio}:{self.exact_keyword_boost}"
             f"|hybrid={self.hybrid_fts_weight}:{int(self.sqlite_dense_enabled)}:{int(self.hnsw_enabled)}"
@@ -2400,15 +3095,64 @@ class RAGEngine:
                 hasher.update(block)
         return hasher.hexdigest()
 
-    def _source_name(self, file_path: str) -> str:
-        return os.path.basename(file_path)
+    def _source_name(self, file_path: str, original_filename: Optional[str] = None) -> str:
+        candidate = str(original_filename or "").strip()
+        if candidate:
+            candidate = candidate.replace("\\", "/").rsplit("/", 1)[-1].strip()
+        if not candidate:
+            candidate = os.path.basename(file_path)
+        candidate = "".join(char for char in candidate if ord(char) >= 32).strip()
+        candidate = candidate.replace("::part:", "_part_")
+        return candidate or os.path.basename(file_path)
+
+    def _source_identity_key(self, filename: str) -> str:
+        basename = str(filename or "").replace("\\", "/").rsplit("/", 1)[-1].strip()
+        return unicodedata.normalize("NFKC", basename).casefold()
+
+    def _find_previous_source_records(
+        self,
+        source_path: str,
+        original_filename: str,
+    ) -> List[Dict[str, str]]:
+        identity_key = self._source_identity_key(original_filename or source_path)
+        if not identity_key:
+            return []
+        conn = self._connect_db()
+        conn.row_factory = sqlite3.Row
+        records: Dict[str, Dict[str, str]] = {}
+        try:
+            if _table_exists(conn, "files"):
+                for row in conn.execute(
+                    "SELECT source_path, orig_name, stored_path FROM files"
+                ).fetchall():
+                    row_source = str(row["source_path"] or "").strip()
+                    row_original = str(row["orig_name"] or row_source).strip()
+                    if row_source and self._source_identity_key(row_original) == identity_key:
+                        records[row_source] = {
+                            "source_path": row_source,
+                            "stored_path": str(row["stored_path"] or "").strip(),
+                        }
+            if _table_exists(conn, "source_uploads"):
+                for row in conn.execute(
+                    "SELECT source_path, original_filename FROM source_uploads"
+                ).fetchall():
+                    row_source = str(row["source_path"] or "").strip()
+                    row_original = str(row["original_filename"] or row_source).strip()
+                    if row_source and self._source_identity_key(row_original) == identity_key:
+                        records.setdefault(
+                            row_source,
+                            {"source_path": row_source, "stored_path": ""},
+                        )
+        finally:
+            conn.close()
+        return [records[key] for key in sorted(records)]
 
     def _source_child_prefix(self, source_path: str) -> str:
         return f"{source_path}::part:"
 
     def _slugify_title(self, text: str, max_len: int = 48) -> str:
         raw = re.sub(r"\s+", " ", (text or "").strip().lower())
-        slug = re.sub(r"[^0-9a-z가-힣]+", "-", raw).strip("-")
+        slug = _SLUG_DISALLOWED_RE.sub("-", raw).strip("-")
         if not slug:
             return "part"
         return slug[:max_len]
@@ -2524,9 +3268,9 @@ class RAGEngine:
 
     def _infer_doc_role(self, source_type: str, source_name: str = "") -> str:
         hint = (source_name or "").strip().lower()
-        if any(k in hint for k in ("사례", "질답", "faq", "q&a", "qa", "case")):
+        if any(k in hint for k in ("faq", "q&a", "qa", "case", "casebook")):
             return DOC_ROLE_CASEBOOK
-        if any(k in hint for k in ("지침", "규정", "manual", "guide")):
+        if any(k in hint for k in ("manual", "guide", "guideline", "rule")):
             return DOC_ROLE_GUIDE
         if source_type == "xlsx":
             return DOC_ROLE_CASEBOOK
@@ -2554,7 +3298,7 @@ class RAGEngine:
     def _estimate_tokens_for_pack(self, text: str) -> int:
         if not text:
             return 0
-        tokens = re.findall(r"[0-9A-Za-z가-힣]+", text)
+        tokens = re.findall(r"[0-9A-Za-z_]+", text)
         return max(1, int(len(tokens) * 1.05))
 
     def _upsert_source_upload_meta(
@@ -2667,10 +3411,10 @@ class RAGEngine:
         line_end = int(row.get("line_end", line_start) or line_start)
         section = (row.get("section", "") or "").strip()
         if line_start > 0:
-            return f"라인 {line_start}-{line_end}"
+            return f"{LABEL_LINE} {line_start}-{line_end}"
         if section:
             return section
-        return "위치 정보 없음"
+        return LABEL_NO_LOCATION
 
     def _extract_xlsx_row_kv(self, line: str) -> Tuple[Optional[int], Dict[str, str]]:
         m = re.match(r"^Row\s+(\d+)\s*:\s*(.*)$", (line or "").strip(), flags=re.IGNORECASE)
@@ -2702,8 +3446,6 @@ class RAGEngine:
         if not lines:
             return []
 
-        question_markers = ("질문", "question", "문의", "query", "q")
-        answer_markers = ("답변", "answer", "해설", "조치", "결과", "a")
         current_sheet = default_sheet or ""
         records: List[Dict[str, Any]] = []
 
@@ -2721,9 +3463,9 @@ class RAGEngine:
             answer = ""
             for k, v in kv.items():
                 norm = re.sub(r"\s+", "", k).lower()
-                if (not question) and any(m in norm for m in question_markers):
+                if (not question) and any(m in norm for m in QUESTION_COLUMN_MARKERS):
                     question = v
-                if (not answer) and any(m in norm for m in answer_markers):
+                if (not answer) and any(m in norm for m in ANSWER_COLUMN_MARKERS):
                     answer = v
 
             if not question:
@@ -2823,12 +3565,12 @@ class RAGEngine:
 
             source_preview = ", ".join(source_order[:3]) if source_order else "-"
             if len(source_order) > 3:
-                source_preview += f" 외 {len(source_order) - 3}개"
+                source_preview += f" +{len(source_order) - 3} more"
 
             header = (
-                f"[통합정리-{normalized_group.upper()}]\n"
-                f"[최신 업로드 반영 시각] {self._format_timestamp(max_uploaded)}\n"
-                f"[출처 요약] {source_preview}\n"
+                f"{normalized_bundle_header(normalized_group)}\n"
+                f"[{LABEL_LATEST_UPLOAD_REFLECTED_AT}] {self._format_timestamp(max_uploaded)}\n"
+                f"[{LABEL_SOURCE_SUMMARY}] {source_preview}\n"
             )
             body = "\n\n---\n\n".join(parts)
             text = f"{header}\n{body}"
@@ -2846,7 +3588,7 @@ class RAGEngine:
                     "row_end": item_row,
                     "line_start": item_line,
                     "line_end": item_line,
-                    "section": f"통합정리-{normalized_group.upper()} (최신우선)",
+                    "section": normalized_bundle_section(normalized_group),
                     "normalized_group": normalized_group,
                     "source_updated_at": int(max_uploaded),
                 }
@@ -2889,8 +3631,8 @@ class RAGEngine:
             location = self._build_txt_location_label(row)
 
             entry_text = (
-                f"[출처] {source_label} | 업로드={self._format_timestamp(uploaded_at)}\n"
-                f"[위치] {location}\n"
+                f"[{LABEL_SOURCE}] {source_label} | {LABEL_UPLOAD} {self._format_timestamp(uploaded_at)}\n"
+                f"[{LABEL_LOCATION}] {location}\n"
                 f"{text}"
             )
             entries_by_role.setdefault(row_role, []).append(
@@ -2960,7 +3702,7 @@ class RAGEngine:
 
                 row_no = int(qa.get("row", 0) or 0)
                 sheet = (qa.get("sheet", default_sheet) or default_sheet or "-").strip()
-                location = f"{sheet} 행 {row_no}" if row_no > 0 else f"{sheet}"
+                location = f"{sheet} {LABEL_ROW} {row_no}" if row_no > 0 else f"{sheet}"
                 answers.append(
                     {
                         "answer": answer,
@@ -2986,19 +3728,19 @@ class RAGEngine:
                 reverse=True,
             )
 
-            lines = [f"[질문] {question}", "[답변 우선순위]"]
+            lines = [f"[{LABEL_QUESTION}] {question}", f"[{LABEL_ANSWER_PRIORITY}]"]
             for idx, ans in enumerate(answers[: self.normalized_conflict_limit], start=1):
-                label = "최신" if idx == 1 else f"이전{idx - 1}"
-                answer_text = (ans.get("answer", "") or "").strip() or "(답변 공란)"
+                label = LABEL_LATEST if idx == 1 else f"이전{idx - 1}"
+                answer_text = (ans.get("answer", "") or "").strip() or "(답변 공백)"
                 lines.append(f"{idx}. ({label}) {answer_text}")
                 lines.append(
                     "   "
-                    f"출처={ans.get('source_label', ans.get('source_path', '-'))} | "
-                    f"위치={ans.get('location', '-')} | "
-                    f"업로드={self._format_timestamp(int(ans.get('uploaded_at', 0) or 0))}"
+                    f"{LABEL_SOURCE}={ans.get('source_label', ans.get('source_path', '-'))} | "
+                    f"{LABEL_LOCATION}={ans.get('location', '-')} | "
+                    f"{LABEL_UPLOAD}={self._format_timestamp(int(ans.get('uploaded_at', 0) or 0))}"
                 )
             if len(answers) > self.normalized_conflict_limit:
-                lines.append(f"... 추가 답변 {len(answers) - self.normalized_conflict_limit}건")
+                lines.append(f"... additional answers: {len(answers) - self.normalized_conflict_limit}")
 
             latest = answers[0]
             entries.append(
@@ -3257,6 +3999,7 @@ class RAGEngine:
         emb_large: Optional[np.ndarray] = None,
         meta: Optional[Dict[str, Any]] = None,
     ):
+        previous_meta = self._get_file_cache_meta(source_path) or {}
         items_path, large_path = self._cache_paths(source_path, file_hash)
         payload_to_store: Dict[str, Any] = {"items": items}
         normalized_meta = _normalize_pdf_ingest_stats(meta)
@@ -3275,6 +4018,23 @@ class RAGEngine:
             emb_large_cache_path=emb_path_for_meta,
             item_count=len(items),
         )
+        active_paths = {
+            os.path.realpath(os.path.abspath(value))
+            for value in (items_path, emb_path_for_meta)
+            if value
+        }
+        for key in (
+            "items_cache_path",
+            "embeddings_cache_path",
+            "emb_small_cache_path",
+            "emb_large_cache_path",
+        ):
+            previous_path = str(previous_meta.get(key, "") or "").strip()
+            if not previous_path:
+                continue
+            if os.path.realpath(os.path.abspath(previous_path)) in active_paths:
+                continue
+            _remove_managed_file(previous_path, [self.cache_dir])
 
     def _lazy_ocr_cache_dir(self) -> str:
         lazy_dir = os.path.join(self.cache_dir, "lazy_ocr")
@@ -3370,7 +4130,7 @@ class RAGEngine:
         text = str(row.get("text", "") or "")
         if is_weak_ocr_hint_text(text):
             return True
-        return any(marker in text for marker in ("표행:", "표행요약:", "표값:", "표의미:"))
+        return any(marker in text for marker in TABLE_HINT_MARKERS)
 
     def get_lazy_pdf_page_text(self, source_path: str, page_no: int) -> str:
         normalized_source = (source_path or "").strip()
@@ -3544,6 +4304,7 @@ class RAGEngine:
         document_role: Optional[str] = None,
         progress_callback: Optional[Callable[..., None]] = None,
         force_pdf_ocr: bool = False,
+        pdf_ocr_mode: str = "",
     ) -> Dict[str, Any]:
         """Prepare OCR/text chunks for ingest without mutating chunk/index state."""
         phase_timings: Dict[str, float] = {"ocr_duration_seconds": 0.0}
@@ -3554,7 +4315,7 @@ class RAGEngine:
         print(f"RAGEngine: Ingesting {file_path}...")
         ext = os.path.splitext(file_path)[1].lower()
         _progress(12, "파일 형식과 버전을 확인하는 중입니다.", "inspect_file")
-        source_path = self._source_name(file_path)
+        source_path = self._source_name(file_path, original_filename=original_filename)
         file_hash = self._compute_file_hash(file_path)
         _progress(18, "기존 처리 결과를 확인하는 중입니다.", "check_cache")
         source_type = (
@@ -3572,12 +4333,28 @@ class RAGEngine:
             return {"status": "unsupported", "source_path": source_path, "used_cache": False}
 
         source_label = (original_filename or source_path or "").strip() or source_path
+        previous_source_records = self._find_previous_source_records(
+            source_path=source_path,
+            original_filename=source_label,
+        )
         explicit_doc_role = self._normalize_doc_role(document_role)
         inferred_doc_role = (
             explicit_doc_role
             if explicit_doc_role != DOC_ROLE_UNKNOWN
             else self._infer_doc_role(source_type=source_type, source_name=source_label)
         )
+        txt_target_tokens = int(getattr(self, "txt_target_tokens", 640) or 640)
+        txt_max_tokens = int(getattr(self, "txt_max_tokens", 900) or 900)
+        pdf_target_tokens = int(getattr(self, "pdf_target_tokens", txt_target_tokens) or txt_target_tokens)
+        pdf_max_tokens = int(getattr(self, "pdf_max_tokens", txt_max_tokens) or txt_max_tokens)
+        hwpx_target_tokens = int(getattr(self, "hwpx_target_tokens", 220) or 220)
+        hwpx_max_tokens = int(getattr(self, "hwpx_max_tokens", 320) or 320)
+        txt_target_tokens_real = int(getattr(self, "txt_target_tokens_real", txt_target_tokens) or txt_target_tokens)
+        txt_max_tokens_real = int(getattr(self, "txt_max_tokens_real", txt_max_tokens) or txt_max_tokens)
+        pdf_target_tokens_real = int(getattr(self, "pdf_target_tokens_real", pdf_target_tokens) or pdf_target_tokens)
+        pdf_max_tokens_real = int(getattr(self, "pdf_max_tokens_real", pdf_max_tokens) or pdf_max_tokens)
+        hwpx_target_tokens_real = int(getattr(self, "hwpx_target_tokens_real", hwpx_target_tokens) or hwpx_target_tokens)
+        hwpx_max_tokens_real = int(getattr(self, "hwpx_max_tokens_real", hwpx_max_tokens) or hwpx_max_tokens)
         used_cache = False
         uploaded_at = int(time.time())
         version = file_hash[:12]
@@ -3593,7 +4370,14 @@ class RAGEngine:
             }
         ]
 
-        if source_type == "pdf" and force_pdf_ocr:
+        high_quality_pdf_ocr = str(pdf_ocr_mode or "").strip().lower().replace("-", "_") in {
+            "high_quality",
+            "highquality",
+            "quality",
+            "vl",
+            "vl_only",
+        }
+        if source_type == "pdf" and (force_pdf_ocr or high_quality_pdf_ocr):
             cached = None
         else:
             with self._engine_lock:
@@ -3650,12 +4434,11 @@ class RAGEngine:
                     source_entries = []
                     _progress(54, "텍스트 조각을 정리하는 중입니다.", "chunk_text")
                     for part in split_parts:
-                        part_items = chunk_txt_items(
+                        part_items = self._split_lines_for_real_token_budget(
                             part["lines"],
-                            target_tokens=self.txt_target_tokens,
+                            target_tokens=txt_target_tokens_real,
                             min_tokens=self.txt_min_tokens,
-                            max_tokens=self.txt_max_tokens,
-                            overlap_ratio=self.txt_overlap_ratio,
+                            max_tokens=txt_max_tokens_real,
                         )
                         if not part_items:
                             continue
@@ -3672,12 +4455,11 @@ class RAGEngine:
                         items.extend(part_items)
                 else:
                     _progress(54, "텍스트 조각을 정리하는 중입니다.", "chunk_text")
-                    items = chunk_txt_items(
+                    items = self._split_lines_for_real_token_budget(
                         raw_lines,
-                        target_tokens=self.txt_target_tokens,
+                        target_tokens=txt_target_tokens_real,
                         min_tokens=self.txt_min_tokens,
-                        max_tokens=self.txt_max_tokens,
-                        overlap_ratio=self.txt_overlap_ratio,
+                        max_tokens=txt_max_tokens_real,
                     )
                     for item in items:
                         item["source_path"] = source_path
@@ -3741,12 +4523,11 @@ class RAGEngine:
                         source_path=source_path,
                     )
                 else:
-                    items = chunk_txt_items(
+                    items = self._split_lines_for_real_token_budget(
                         raw_lines,
-                        target_tokens=self.hwpx_target_tokens,
+                        target_tokens=hwpx_target_tokens_real,
                         min_tokens=self.hwpx_min_tokens,
-                        max_tokens=self.hwpx_max_tokens,
-                        overlap_ratio=self.hwpx_overlap_ratio,
+                        max_tokens=hwpx_max_tokens_real,
                     )
                 for item in items:
                     item["source_path"] = source_path
@@ -3754,15 +4535,62 @@ class RAGEngine:
             elif ext == ".pdf":
                 _progress(28, "PDF 문서 구조를 확인하는 중입니다.", "inspect_pdf")
                 ocr_started = time.perf_counter()
+                worker_release_seconds = 0.0
+                worker_released = False
+                worker_pids: List[int] = []
+                worker_alive_after_shutdown: List[int] = []
+                worker_shutdown_confirmed = True
                 try:
                     pdf_result = extract_pdf_pages(
                         file_path,
                         progress_callback=progress_callback,
                         force_upload_ocr=bool(force_pdf_ocr),
+                        pdf_ocr_mode=pdf_ocr_mode,
                     )
                 finally:
                     phase_timings["ocr_duration_seconds"] = max(0.0, time.perf_counter() - ocr_started)
                     release_cached_ocr_model()
+                release_started = time.perf_counter()
+                _progress(71, "PDF OCR worker를 종료하고 GPU 메모리를 회수하는 중입니다.", "release_pdf_ocr_worker")
+                try:
+                    shutdown_info = shutdown_persistent_ocr_worker() or {}
+                    for raw_pid in list(shutdown_info.get("worker_pids", []) or []):
+                        try:
+                            pid = int(raw_pid)
+                        except (TypeError, ValueError):
+                            continue
+                        if pid > 0:
+                            worker_pids.append(pid)
+                    for raw_pid in list(shutdown_info.get("alive_after_shutdown", []) or []):
+                        try:
+                            pid = int(raw_pid)
+                        except (TypeError, ValueError):
+                            continue
+                        if pid > 0:
+                            worker_alive_after_shutdown.append(pid)
+                    worker_shutdown_confirmed = bool(shutdown_info.get("shutdown_confirmed", True))
+                    worker_released = True
+                finally:
+                    worker_release_seconds = max(0.0, time.perf_counter() - release_started)
+                worker_pids = sorted(set(worker_pids))
+                worker_alive_after_shutdown = sorted(set(worker_alive_after_shutdown))
+                if not worker_shutdown_confirmed:
+                    print(
+                        "[UPLOAD][WARN] stage=release_pdf_ocr_worker "
+                        f"source_path={source_path} worker_pids={worker_pids} "
+                        f"alive_after_shutdown={worker_alive_after_shutdown}",
+                        file=sys.stderr,
+                    )
+                _progress(
+                    72,
+                    "PDF OCR worker release completed.",
+                    "release_pdf_ocr_worker",
+                    ocr_worker_released=worker_released,
+                    ocr_worker_release_seconds=round(worker_release_seconds, 3),
+                    ocr_worker_pids=worker_pids,
+                    ocr_worker_shutdown_confirmed=worker_shutdown_confirmed,
+                    ocr_worker_alive_after_shutdown=worker_alive_after_shutdown,
+                )
                 page_records = list(pdf_result.get("pages", []) or [])
                 parser_name = str(pdf_result.get("parser", "") or "paddleocr_vl")
                 pdf_ingest_stats = {
@@ -3781,12 +4609,57 @@ class RAGEngine:
                     "ocr_elapsed_seconds": pdf_result.get("ocr_elapsed_seconds"),
                     "ocr_pages_processed": pdf_result.get("ocr_pages_processed"),
                     "ocr_pages_per_minute": pdf_result.get("ocr_pages_per_minute"),
+                    "ocr_pages_attempted": pdf_result.get("ocr_pages_attempted"),
+                    "ocr_pages_emitted": pdf_result.get("ocr_pages_emitted"),
+                    "ocr_pages_skipped_empty": pdf_result.get("ocr_pages_skipped_empty"),
+                    "ocr_pages_skipped_short_text": pdf_result.get("ocr_pages_skipped_short_text"),
+                    "ocr_attempted_pages_per_minute": pdf_result.get("ocr_attempted_pages_per_minute"),
+                    "ocr_emitted_pages_per_minute": pdf_result.get("ocr_emitted_pages_per_minute"),
+                    "ocr_worker_released": worker_released,
+                    "ocr_worker_release_seconds": round(worker_release_seconds, 3),
+                    "ocr_worker_pids": worker_pids,
+                    "ocr_worker_shutdown_confirmed": worker_shutdown_confirmed,
+                    "ocr_worker_alive_after_shutdown": worker_alive_after_shutdown,
                     "ocr_target_pages": pdf_result.get("ocr_target_pages"),
                     "ocr_target_seconds": pdf_result.get("ocr_target_seconds"),
                     "ocr_target_met": pdf_result.get("ocr_target_met"),
+                    "ocr_subset_build_seconds": pdf_result.get("ocr_subset_build_seconds"),
+                    "ocr_model_load_seconds": pdf_result.get("ocr_model_load_seconds"),
+                    "ocr_predict_seconds": pdf_result.get("ocr_predict_seconds"),
+                    "ocr_output_materialize_seconds": pdf_result.get("ocr_output_materialize_seconds"),
+                    "ocr_payload_convert_seconds": pdf_result.get("ocr_payload_convert_seconds"),
+                    "ocr_fragment_collect_seconds": pdf_result.get("ocr_fragment_collect_seconds"),
+                    "ocr_page_dedupe_seconds": pdf_result.get("ocr_page_dedupe_seconds"),
+                    "ocr_page_join_seconds": pdf_result.get("ocr_page_join_seconds"),
+                    "ocr_text_merge_seconds": pdf_result.get("ocr_text_merge_seconds"),
+                    "ocr_merge_seconds": pdf_result.get("ocr_merge_seconds"),
+                    "ocr_batch_count": pdf_result.get("ocr_batch_count"),
+                    "ocr_backend": pdf_result.get("ocr_backend"),
+                    "ocr_backend_attempted": pdf_result.get("ocr_backend_attempted"),
+                    "ocr_backend_effective": pdf_result.get("ocr_backend_effective"),
+                    "ocr_backend_fallback_used": pdf_result.get("ocr_backend_fallback_used"),
+                    "ocr_fast_pages": pdf_result.get("ocr_fast_pages"),
+                    "ocr_vl_pages": pdf_result.get("ocr_vl_pages"),
+                    "ocr_fast_seconds": pdf_result.get("ocr_fast_seconds"),
+                    "ocr_vl_seconds": pdf_result.get("ocr_vl_seconds"),
+                    "ocr_fast_avg_score": pdf_result.get("ocr_fast_avg_score"),
+                    "ocr_fast_pair_ratio": pdf_result.get("ocr_fast_pair_ratio"),
+                    "ocr_fast_orphan_ratio": pdf_result.get("ocr_fast_orphan_ratio"),
+                    "ocr_high_quality_requested": pdf_result.get("ocr_high_quality_requested"),
                 }
                 items = []
                 page_count = max(1, len(page_records))
+                compaction_totals = {
+                    "chars_before_compaction": 0,
+                    "chars_after_compaction": 0,
+                    "lines_before_dedupe": 0,
+                    "lines_after_dedupe": 0,
+                    "hints_dropped": 0,
+                }
+                embedding_compaction_max_chunk_chars = max(
+                    400,
+                    int(getattr(self, "embedding_compaction_max_chunk_chars", 1800) or 1800),
+                )
                 for page_index, page in enumerate(page_records, start=1):
                     page_no = max(1, int(page.get("page_no", 0) or 0))
                     total_pdf_pages = max(
@@ -3815,11 +4688,18 @@ class RAGEngine:
                     if not page_text and not table_hint_lines and not lazy_ocr_hint_lines:
                         continue
 
+                    compact_lines, compact_stats = self._compact_pdf_embedding_payload(
+                        page_text,
+                        table_hint_lines,
+                        lazy_ocr_hint_lines,
+                    )
+                    for stat_key, stat_value in compact_stats.items():
+                        compaction_totals[stat_key] += int(stat_value or 0)
+                    if not compact_lines:
+                        continue
+
                     page_lines: List[Dict[str, Any]] = []
-                    for line_idx, raw_line in enumerate(page_text.splitlines(), start=1):
-                        normalized_line = re.sub(r"\s+", " ", (raw_line or "").strip())
-                        if not normalized_line:
-                            continue
+                    for line_idx, normalized_line in enumerate(compact_lines, start=1):
                         page_lines.append(
                             {
                                 "text": normalized_line,
@@ -3829,27 +4709,14 @@ class RAGEngine:
                                 "is_section": False,
                                 }
                             )
-                    extra_line_no = len(page_lines)
-                    for normalized_hint in table_hint_lines + lazy_ocr_hint_lines:
-                        extra_line_no += 1
-                        page_lines.append(
-                            {
-                                "text": normalized_hint,
-                                "line_start": extra_line_no,
-                                "line_end": extra_line_no,
-                                "file_path": source_label,
-                                "is_section": False,
-                            }
-                        )
                     if not page_lines:
                         continue
 
-                    page_items = chunk_txt_items(
+                    page_items = self._split_lines_for_real_token_budget(
                         page_lines,
-                        target_tokens=self.pdf_target_tokens,
+                        target_tokens=pdf_target_tokens_real,
                         min_tokens=self.pdf_min_tokens,
-                        max_tokens=self.pdf_max_tokens,
-                        overlap_ratio=self.txt_overlap_ratio,
+                        max_tokens=pdf_max_tokens_real,
                     )
                     for chunk in page_items:
                         chunk["source_path"] = source_path
@@ -3857,7 +4724,16 @@ class RAGEngine:
                         chunk["page_no"] = page_no
                         chunk["page_parser"] = page_parser
                         chunk["parser_name"] = parser_name
+                        chunk["embedding_text"] = build_embedding_text(
+                            text=str(chunk.get("text", "") or "")[:embedding_compaction_max_chunk_chars],
+                            source_path=source_label,
+                            doc_role=inferred_doc_role,
+                            heading_path=[f"PDF page {page_no}"],
+                            chunk_kind="body",
+                        )
                     items.extend(page_items)
+                pdf_ingest_stats.update(compaction_totals)
+                pdf_ingest_stats["chunks_created"] = int(len(items))
 
             if not items:
                 return {"status": "empty", "source_path": source_path, "used_cache": False}
@@ -3928,6 +4804,7 @@ class RAGEngine:
             "pdf_ingest_stats": pdf_ingest_stats,
             "parser_name": parser_name,
             "source_entries": source_entries,
+            "previous_source_records": previous_source_records,
             "used_cache": used_cache,
             "phase_timings": phase_timings,
         }
@@ -3959,6 +4836,7 @@ class RAGEngine:
             pdf_ingest_stats = dict(prepared.get("pdf_ingest_stats", {}) or {})
             parser_name = str(prepared.get("parser_name", "") or "txt_plain")
             source_entries = list(prepared.get("source_entries", []) or [])
+            previous_source_records = list(prepared.get("previous_source_records", []) or [])
             used_cache = bool(prepared.get("used_cache", False))
             phase_timings = dict(prepared.get("phase_timings", {}) or {})
             phase_timings.setdefault("ocr_duration_seconds", 0.0)
@@ -3976,8 +4854,79 @@ class RAGEngine:
                     }
                 ]
 
+            def _phase_log(stage: str, status: str, **fields: Any) -> None:
+                field_parts = [f"source_path={source_path or '-'}"]
+                for key, value in fields.items():
+                    field_parts.append(f"{key}={value}")
+                print(f"[UPLOAD][PHASE] stage={stage} status={status} " + " ".join(field_parts), flush=True)
+
+            def _phase_progress(percent: int, message: str, stage: str, **progress_meta: Any) -> None:
+                meta = dict(progress_meta or {})
+                meta.setdefault("phase_name_effective", stage)
+                _progress(percent, message, stage, **meta)
+
+            def _run_with_phase_heartbeat(
+                fn: Callable[[], Any],
+                *,
+                percent: int,
+                message: str,
+                stage: str,
+                interval_seconds: float = 25.0,
+                **progress_meta: Any,
+            ) -> Any:
+                stop_event = threading.Event()
+                meta = dict(progress_meta or {})
+
+                def _heartbeat() -> None:
+                    while not stop_event.wait(interval_seconds):
+                        _phase_progress(percent, message, stage, **meta)
+
+                heartbeat_thread = threading.Thread(target=_heartbeat, daemon=True)
+                _phase_progress(percent, message, stage, **meta)
+                heartbeat_thread.start()
+                try:
+                    return fn()
+                finally:
+                    stop_event.set()
+                    heartbeat_thread.join(timeout=0.2)
+
             persist_started = time.perf_counter()
-            _progress(78, "문서 메타데이터를 정리하는 중입니다.", "persist_meta")
+            _phase_log("persist_meta", "start", rows=len(items))
+            _phase_progress(
+                78,
+                "문서 메타데이터를 정리하는 중입니다.",
+                "persist_meta",
+                phase_rows_total=len(items),
+                phase_rows_done=0,
+            )
+            superseded_sources = sorted(
+                {
+                    str(record.get("source_path", "") or "").strip()
+                    for record in previous_source_records
+                    if str(record.get("source_path", "") or "").strip()
+                    and str(record.get("source_path", "") or "").strip() != source_path
+                }
+            )
+            superseded_cleanup: Dict[str, Any] = {
+                "chunk_ids": [],
+                "cache_paths": [],
+                "stored_paths": [],
+            }
+            if superseded_sources:
+                cleanup_conn = self._connect_db()
+                try:
+                    cleanup_conn.execute("BEGIN IMMEDIATE")
+                    superseded_cleanup = _delete_source_records(
+                        cleanup_conn,
+                        superseded_sources,
+                        delete_normalized_groups=False,
+                    )
+                    cleanup_conn.commit()
+                except Exception:
+                    cleanup_conn.rollback()
+                    raise
+                finally:
+                    cleanup_conn.close()
             file_id = self._upsert_file_record(
                 source_path=source_path,
                 file_hash=file_hash,
@@ -4000,6 +4949,13 @@ class RAGEngine:
             )
 
             deleted_count, deleted_chunk_ids = self._delete_chunks_for_source(source_path)
+            superseded_chunk_ids = [
+                int(value)
+                for value in list(superseded_cleanup.get("chunk_ids", []) or [])
+                if int(value or 0) > 0
+            ]
+            deleted_chunk_ids = sorted(set([*deleted_chunk_ids, *superseded_chunk_ids]))
+            deleted_count += len(superseded_chunk_ids)
             self._delete_source_upload_meta_for_source(source_path)
             for entry in source_entries:
                 self._upsert_source_upload_meta(
@@ -4023,14 +4979,19 @@ class RAGEngine:
                 for entry in source_entries
             }
 
+            _phase_log("store_chunks", "start", rows=len(items))
             insert_step = max(1, len(items) // 4) if items else 1
             for idx, item in enumerate(items):
                 if idx == 0 or idx + 1 == len(items) or ((idx + 1) % insert_step) == 0:
                     insert_percent = 84 + int(round(((idx + 1) / max(1, len(items))) * 8))
-                    _progress(
+                    _phase_progress(
                         insert_percent,
                         f"검색 조각을 저장하는 중입니다. ({idx + 1}/{len(items)})",
                         "store_chunks",
+                        phase_rows_total=len(items),
+                        phase_rows_done=idx + 1,
+                        phase_chunks_total=len(items),
+                        phase_chunks_done=idx + 1,
                     )
                 item_source_path = (item.get("source_path", "") or source_path).strip() or source_path
                 item_doc_role = source_role_map.get(item_source_path, inferred_doc_role)
@@ -4079,57 +5040,243 @@ class RAGEngine:
 
             conn.commit()
             conn.close()
+            _phase_log("store_chunks", "done", rows=len(new_ids))
             phase_timings["persist_duration_seconds"] = max(0.0, time.perf_counter() - persist_started)
+            _phase_log(
+                "persist_meta",
+                "done",
+                rows=len(items),
+                phase_duration_seconds=f"{phase_timings['persist_duration_seconds']:.3f}",
+                elapsed_seconds=f"{phase_timings['persist_duration_seconds']:.3f}",
+            )
 
             index_started = time.perf_counter()
-            _progress(94, "통합 조각을 갱신하는 중입니다.", "refresh_index")
-            normalized_refresh = self._refresh_normalized_chunks_and_index(
-                affected_groups=self._normalized_groups_for_source_type(source_type),
+            _phase_log("refresh_index", "start", rows=len(items))
+            refresh_chunks_total = max(len(items), len(new_ids) + len(deleted_chunk_ids))
+            normalized_refresh = _run_with_phase_heartbeat(
+                lambda: self._refresh_normalized_chunks_and_index(
+                    affected_groups=self._normalized_groups_for_source_type(source_type),
+                ),
+                percent=94,
+                message="통합 조각과 검색 인덱스를 갱신하는 중입니다.",
+                stage="refresh_index",
+                phase_chunks_total=refresh_chunks_total,
+                phase_chunks_done=0,
             )
+            changed_normalized_ids = list(normalized_refresh.get("inserted_chunk_ids", []) or [])
+            deleted_normalized_ids = list(normalized_refresh.get("deleted_chunk_ids", []) or [])
             phase_timings["index_duration_seconds"] = max(0.0, time.perf_counter() - index_started)
+            _phase_log(
+                "refresh_index",
+                "done",
+                rows=len(items),
+                changed_chunks=len(changed_normalized_ids),
+                deleted_chunks=len(deleted_normalized_ids),
+                phase_duration_seconds=f"{phase_timings['index_duration_seconds']:.3f}",
+                elapsed_seconds=f"{phase_timings['index_duration_seconds']:.3f}",
+            )
+
             embedding_started = time.perf_counter()
-            _progress(96, "검색 임베딩과 인덱스를 갱신하는 중입니다.", "embed_chunks")
-            self._sync_sqlite_search_artifacts(
-                changed_chunk_ids=[
-                    *new_ids,
-                    *list(normalized_refresh.get("inserted_chunk_ids", []) or []),
-                ],
-                deleted_chunk_ids=[
-                    *deleted_chunk_ids,
-                    *list(normalized_refresh.get("deleted_chunk_ids", []) or []),
-                ],
-                index_name="large",
+            embed_chunk_ids = [*new_ids, *changed_normalized_ids]
+            deleted_embed_chunk_ids = [*deleted_chunk_ids, *deleted_normalized_ids]
+            total_embed_rows = len(embed_chunk_ids)
+            _phase_log("embed_chunks", "start", rows=total_embed_rows)
+
+            def _emit_embed_progress(
+                batch_index: int,
+                total_batches: int,
+                rows_done: int,
+                **embed_meta: Any,
+            ) -> None:
+                _phase_progress(
+                    96,
+                    (
+                        "임베딩과 벡터 저장을 진행하는 중입니다. "
+                        f"(batch {batch_index}/{max(1, total_batches)}, rows {rows_done}/{total_embed_rows})"
+                    ),
+                    "embed_chunks",
+                    phase_rows_total=total_embed_rows,
+                    phase_rows_done=rows_done,
+                    phase_chunks_total=total_embed_rows,
+                    phase_chunks_done=rows_done,
+                    embed_batch=batch_index,
+                    embed_batches=total_batches,
+                    embed_rows_done=rows_done,
+                    embed_rows_total=total_embed_rows,
+                    **dict(embed_meta or {}),
+                )
+
+            _run_with_phase_heartbeat(
+                lambda: self._sync_sqlite_search_artifacts(
+                    changed_chunk_ids=embed_chunk_ids,
+                    deleted_chunk_ids=deleted_embed_chunk_ids,
+                    index_name="large",
+                    vector_progress_callback=_emit_embed_progress,
+                    vector_log_context={"source_path": source_path},
+                ),
+                percent=96,
+                message="임베딩과 벡터 저장을 준비하는 중입니다.",
+                stage="embed_chunks",
+                phase_rows_total=total_embed_rows,
+                phase_rows_done=0,
+                phase_chunks_total=total_embed_rows,
+                phase_chunks_done=0,
+                embed_batch=0,
+                embed_batches=0,
+                embed_rows_done=0,
+                embed_rows_total=total_embed_rows,
+                embed_input_tokens_total=0,
+                embed_input_tokens_done=0,
+                embed_input_tokens_p95=0,
+                embed_input_tokens_max=0,
+                embed_truncated_rows=0,
+                embed_effective_batch_tokens=0,
             )
             phase_timings["embedding_duration_seconds"] = max(0.0, time.perf_counter() - embedding_started)
-            derived_started = time.perf_counter()
-            _progress(98, "파생 검색 구조를 동기화하는 중입니다.", "sync_derived")
-            if self.hnsw_enabled:
-                self._rebuild_index_from_db(chunk_count=self._count_indexable_chunks())
-            concept_sync = self._sync_concept_links(
-                changed_chunk_ids=new_ids,
-                deleted_chunk_ids=deleted_chunk_ids,
+            _phase_log(
+                "embed_chunks",
+                "done",
+                rows=total_embed_rows,
+                phase_duration_seconds=f"{phase_timings['embedding_duration_seconds']:.3f}",
+                elapsed_seconds=f"{phase_timings['embedding_duration_seconds']:.3f}",
             )
-            ontology_sync = (
-                self._sync_ontology_facts(
+
+            derived_started = time.perf_counter()
+            _phase_log("sync_derived", "start", rows=len(new_ids))
+
+            indexable_count_before_sync = self._count_indexable_chunks()
+            if self.hnsw_enabled:
+                subphase_started = time.perf_counter()
+                _phase_log("sync_derived", "start", subphase="rebuild_index", rows=indexable_count_before_sync)
+                _run_with_phase_heartbeat(
+                    lambda: self._rebuild_index_from_db(chunk_count=indexable_count_before_sync),
+                    percent=98,
+                    message="파생 검색 구조를 동기화하는 중입니다. (rebuild_index)",
+                    stage="sync_derived",
+                    phase_name_effective="sync_derived_rebuild_index",
+                    phase_chunks_total=indexable_count_before_sync,
+                    phase_chunks_done=0,
+                )
+                _phase_log(
+                    "sync_derived",
+                    "done",
+                    subphase="rebuild_index",
+                    phase_duration_seconds=f"{max(0.0, time.perf_counter() - subphase_started):.3f}",
+                )
+
+            concept_subphase_started = time.perf_counter()
+            _phase_log("sync_derived_concept_embedding", "start", subphase="concept_embedding", rows=len(new_ids))
+            concept_sync = _run_with_phase_heartbeat(
+                lambda: self._sync_concept_links(
                     changed_chunk_ids=new_ids,
                     deleted_chunk_ids=deleted_chunk_ids,
-                )
-                if DOCUMENT_UPLOAD_ONTOLOGY_JOB_ENABLED and getattr(self, "db_path", None)
-                else {"ontology_facts_added": 0, "ontology_facts_deleted": 0}
+                ),
+                percent=98,
+                message="파생 검색 구조를 동기화하는 중입니다. (concept_embedding)",
+                stage="sync_derived",
+                phase_name_effective="sync_derived_concept_embedding",
+                phase_chunks_total=len(new_ids),
+                phase_chunks_done=0,
             )
+            _phase_log(
+                "sync_derived_concept_embedding",
+                "done",
+                subphase="concept_embedding",
+                concept_links_added=int(concept_sync.get("concept_links_added", 0) or 0),
+                phase_duration_seconds=f"{max(0.0, time.perf_counter() - concept_subphase_started):.3f}",
+            )
+
+            ontology_sync = {"ontology_facts_added": 0, "ontology_facts_deleted": 0}
+            if DOCUMENT_UPLOAD_ONTOLOGY_JOB_ENABLED and getattr(self, "db_path", None):
+                ontology_subphase_started = time.perf_counter()
+                _phase_log("sync_derived", "start", subphase="ontology_facts", rows=len(new_ids))
+                ontology_sync = _run_with_phase_heartbeat(
+                    lambda: self._sync_ontology_facts(
+                        changed_chunk_ids=new_ids,
+                        deleted_chunk_ids=deleted_chunk_ids,
+                    ),
+                    percent=98,
+                    message="파생 검색 구조를 동기화하는 중입니다. (ontology_facts)",
+                    stage="sync_derived",
+                    phase_name_effective="sync_derived_ontology_facts",
+                    phase_chunks_total=len(new_ids),
+                    phase_chunks_done=0,
+                )
+                _phase_log(
+                    "sync_derived",
+                    "done",
+                    subphase="ontology_facts",
+                    ontology_facts_added=int(ontology_sync.get("ontology_facts_added", 0) or 0),
+                    phase_duration_seconds=f"{max(0.0, time.perf_counter() - ontology_subphase_started):.3f}",
+                )
+
             wiki_compile_status = "skipped"
             if _env_bool("WIKI_PAGE_WORKFLOW_ENABLED", False):
-                try:
+                wiki_subphase_started = time.perf_counter()
+                _phase_log("sync_derived", "start", subphase="compile_wiki", rows=1)
+
+                def _compile_wiki() -> str:
                     WikiStore(self.db_path).compile_source_page(source_path, space_id=self.kb_id)
-                    wiki_compile_status = "ok"
+                    return "ok"
+
+                try:
+                    wiki_compile_status = _run_with_phase_heartbeat(
+                        _compile_wiki,
+                        percent=98,
+                        message="파생 검색 구조를 동기화하는 중입니다. (compile_wiki)",
+                        stage="sync_derived",
+                        phase_name_effective="sync_derived_compile_wiki",
+                        phase_rows_total=1,
+                        phase_rows_done=0,
+                    )
                 except Exception as exc:
                     wiki_compile_status = "error"
                     print(f"[WIKI][WARN] source={source_path} compile_source_page failed: {exc}", file=sys.stderr)
+                _phase_log(
+                    "sync_derived",
+                    "done",
+                    subphase="compile_wiki",
+                    status_detail=wiki_compile_status,
+                    phase_duration_seconds=f"{max(0.0, time.perf_counter() - wiki_subphase_started):.3f}",
+                )
+
             self.query_cache.clear()
             phase_timings["derived_sync_duration_seconds"] = max(0.0, time.perf_counter() - derived_started)
+            _phase_log(
+                "sync_derived",
+                "done",
+                rows=len(new_ids),
+                concept_links_added=int(concept_sync.get("concept_links_added", 0) or 0),
+                ontology_facts_added=int(ontology_sync.get("ontology_facts_added", 0) or 0),
+                phase_duration_seconds=f"{phase_timings['derived_sync_duration_seconds']:.3f}",
+                elapsed_seconds=f"{phase_timings['derived_sync_duration_seconds']:.3f}",
+            )
 
             normalized_count = self._count_normalized_chunks()
             indexable_count = self._count_indexable_chunks()
+            previous_stored_paths = {
+                str(record.get("stored_path", "") or "").strip()
+                for record in previous_source_records
+                if str(record.get("stored_path", "") or "").strip()
+            }
+            previous_stored_paths.update(
+                str(value or "").strip()
+                for value in list(superseded_cleanup.get("stored_paths", []) or [])
+                if str(value or "").strip()
+            )
+            current_stored_path = os.path.realpath(os.path.abspath(file_path)) if file_path else ""
+            if previous_stored_paths:
+                uploads_dir = os.path.join(self.data_dir, "uploads")
+                for previous_path in sorted(previous_stored_paths):
+                    previous_resolved = os.path.realpath(os.path.abspath(previous_path))
+                    if current_stored_path and previous_resolved == current_stored_path:
+                        continue
+                    _remove_managed_file(previous_path, [uploads_dir])
+            stale_cache_paths = list(superseded_cleanup.get("cache_paths", []) or [])
+            if stale_cache_paths:
+                for cache_path in stale_cache_paths:
+                    _remove_managed_file(str(cache_path or ""), [self.cache_dir])
+            _phase_log("done", "ok", rows=len(new_ids), chunks=len(new_ids))
             return {
                 "status": "ok",
                 "source_path": source_path,
@@ -4156,6 +5303,7 @@ class RAGEngine:
         document_role: Optional[str] = None,
         progress_callback: Optional[Callable[[int, str, str], None]] = None,
         force_pdf_ocr: bool = False,
+        pdf_ocr_mode: str = "",
     ) -> Dict[str, Any]:
         """Ingest a file into the KB and build the large index."""
         prepared = self.prepare_ingest_payload(
@@ -4164,6 +5312,7 @@ class RAGEngine:
             document_role=document_role,
             progress_callback=progress_callback,
             force_pdf_ocr=force_pdf_ocr,
+            pdf_ocr_mode=pdf_ocr_mode,
         )
         if not isinstance(prepared, dict) or prepared.get("status") != "prepared":
             return prepared
@@ -4591,41 +5740,46 @@ class RAGEngine:
                     )
                     score += wiki_memory_boost
                 tabular_query_boost = 0.0
-                row_summary_match = False
+                has_table_markers = any(marker in text for marker in TABLE_HINT_MARKERS)
+                row_summary_match = (
+                    TABLE_ROW_SUMMARY_MARKER in text
+                    or TABLE_SEMANTIC_ROW_MARKER in text
+                )
+                if (not row_summary_match) and str(res.get("source_type", "") or "") in {"pdf", "hwpx", "xlsx"}:
+                    row_summary_match = "|" in text and len(text) >= 40
                 header_match_boost = 0.0
                 table_page_boost = 0.0
                 alias_match_boost = 0.0
+                if has_table_markers and row_summary_match:
+                    tabular_query_boost += 0.08
                 if is_numeric_evidence_query(query):
-                    has_table_markers = any(
-                        marker in text for marker in ("표행:", "표행요약:", "표헤더:", "표값:", "표의미:")
-                    )
-                    row_summary_match = "표행요약:" in text or "표의미: kind=table_row" in text
                     if has_table_markers:
                         tabular_query_boost += 0.08
                     if row_summary_match:
                         tabular_query_boost += 0.06
 
                     query_header_terms = (
-                        "단가",
-                        "금액",
-                        "비용",
-                        "시기",
-                        "언제",
-                        "주기",
-                        "횟수",
-                        "기준월",
-                        "지급대상월",
-                        "월별",
-                        "분기",
-                        "반기",
-                        "연간",
-                        "기일",
+                        "rate",
+                        "amount",
+                        "cost",
+                        "period",
+                        "date",
+                        "cycle",
+                        "count",
+                        "base",
+                        "month",
+                        "quarter",
+                        "year",
+                        "interval",
                     )
                     header_matches = sum(
                         1 for term in query_header_terms if term in query and term in text
                     )
                     if header_matches > 0:
                         header_match_boost = min(0.12, 0.03 * header_matches)
+                        tabular_query_boost += header_match_boost
+                    elif row_summary_match and has_table_markers:
+                        header_match_boost = 0.06
                         tabular_query_boost += header_match_boost
 
                     alias_match_boost = _survey_alias_match_boost(query, text)
@@ -4709,6 +5863,44 @@ class RAGEngine:
             self._set_cached_query_result(query, top_k, index_key, sliced, doc_roles=role_filters)
             return sliced
 
+    def _prune_operational_logs_if_due(
+        self,
+        *,
+        force: bool = False,
+        now_ts: Optional[int] = None,
+    ) -> int:
+        now_value = int(time.time()) if now_ts is None else int(now_ts)
+        if (
+            not force
+            and now_value - int(getattr(self, "_last_log_prune_at", 0) or 0)
+            < int(getattr(self, "log_prune_interval_seconds", 3600) or 3600)
+        ):
+            return 0
+        expire_before = now_value - int(getattr(self, "log_retention_days", 30) or 30) * 86400
+        conn = self._connect_db()
+        removed = 0
+        try:
+            for table in ("retrieval_logs", "answer_logs"):
+                if not _table_exists(conn, table):
+                    continue
+                removed += prune_timestamped_rows(
+                    conn,
+                    table=table,
+                    id_column="log_id",
+                    timestamp_column="created_at",
+                    expire_before=expire_before,
+                    max_rows=int(getattr(self, "log_retention_max_rows", 50000) or 50000),
+                    batch_size=int(getattr(self, "log_prune_batch_size", 2000) or 2000),
+                )
+            conn.commit()
+            self._last_log_prune_at = now_value
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        return removed
+
     def log_retrieval(
         self,
         query_id: str,
@@ -4738,6 +5930,7 @@ class RAGEngine:
         )
         conn.commit()
         conn.close()
+        self._prune_operational_logs_if_due()
 
     def log_answer(
         self,
@@ -4771,6 +5964,7 @@ class RAGEngine:
         log_id = int(c.lastrowid)
         conn.commit()
         conn.close()
+        self._prune_operational_logs_if_due()
         return log_id
 
     def get_recent_retrieval_logs(self, limit: int = 120) -> List[Dict[str, Any]]:
@@ -4810,50 +6004,37 @@ class RAGEngine:
     def _tokenize_for_overlap(self, text: str) -> List[str]:
         if not text:
             return []
-        tokens = re.findall(r"[0-9A-Za-z가-힣]+", text.lower())
+        tokens = _OVERLAP_TERM_RE.findall(text.lower())
         return [t for t in tokens if len(t) >= 2]
 
     def _query_keywords(self, query: str) -> List[str]:
         stopwords = {
-            "해주세요",
-            "해줘",
-            "알려줘",
-            "알려",
-            "알려줄래",
-            "설명",
-            "요약",
-            "정리",
-            "대한",
-            "관련",
-            "문의",
-            "있나요",
-            "인가요",
-            "그리고",
-            "또는",
-            "에서",
-            "으로",
-            "대한",
-            "하는",
-            "같은",
-            "정도",
-            "방법",
-            "방법은",
-            "처리",
-            "처리방법",
-            "처리방법은",
-            "조사방법",
-            "조사방법은",
-            "작성",
-            "작성해",
-            "작성해야해",
-            "어떻게",
-            "경우",
-            "해야해",
-            "농가",
-            "농가가",
+            "the",
+            "and",
+            "for",
+            "with",
+            "from",
+            "that",
+            "this",
+            "what",
+            "how",
+            "when",
+            "where",
+            "which",
+            "guide",
+            "manual",
+            "summary",
+            "document",
+            "upload",
         }
-        terms = self._tokenize_for_overlap(query)
-        return [t for t in terms if t not in stopwords]
+        raw_tokens = self._tokenize_for_overlap(query)
+        keywords: List[str] = []
+        for token in raw_tokens:
+            lowered = token.strip().lower()
+            if len(lowered) < 2 or lowered in stopwords:
+                continue
+            keywords.append(lowered)
+        return list(dict.fromkeys(keywords))
 
     def _extract_code_tokens(self, text: str) -> List[str]:
         if not text:
@@ -4862,7 +6043,7 @@ class RAGEngine:
 
     def _is_code_or_class_query(self, query: str) -> bool:
         compact = re.sub(r"\s+", "", (query or "").lower())
-        hints = ("부호", "코드", "분류", "항목", "번호", "몇번", "몇 번")
+        hints = ("code", "class", "category", "number", "id")
         return any(h in compact for h in hints)
 
     def _has_exact_code(self, text: str, codes: List[str]) -> bool:
@@ -4884,7 +6065,7 @@ class RAGEngine:
         literals: List[str] = []
 
         # Keep quoted phrases as hard lexical anchors.
-        for quoted in re.findall(r"[\"'“”‘’]([^\"'“”‘’]{2,80})[\"'“”‘’]", query):
+        for quoted in _QUOTED_LITERAL_RE.findall(query):
             q = re.sub(r"\s+", " ", quoted).strip().lower()
             if len(q) >= 2:
                 literals.append(q)
@@ -4893,7 +6074,7 @@ class RAGEngine:
         literals.extend(self._extract_code_tokens(query))
 
         # Preserve mixed alpha-numeric tokens (e.g., API names, IDs).
-        for tok in re.findall(r"[0-9A-Za-z가-힣][0-9A-Za-z가-힣._\-/]{2,40}", query):
+        for tok in _MIXED_LITERAL_RE.findall(query):
             t = tok.strip().lower()
             if not t:
                 continue
@@ -4971,8 +6152,8 @@ class RAGEngine:
             total = 0
         else:
             joined = "\n".join((r.get("text", "") or "") for r in results[: max(1, coverage_top_k)]).lower()
-            overlap_tokens = set(self._tokenize_for_overlap(joined))
-            hit_count = len(set(keywords) & overlap_tokens)
+            overlap_terms = set(self._tokenize_for_overlap(joined))
+            hit_count = len(set(keywords) & overlap_terms)
             total = len(set(keywords))
             coverage = float(hit_count / total) if total else 0.0
 
@@ -5018,31 +6199,52 @@ class RAGEngine:
             if group == "txt":
                 bundle_no = int(res.get("line_start", 0) or res.get("row", 0) or 0)
                 if bundle_no > 0:
-                    return f"통합 정리 TXT {bundle_no}번 / 최신 업로드 반영 {updated}{role_tail}"
-                return f"통합 정리 TXT / 최신 업로드 반영 {updated}{role_tail}"
+                    return (
+                        f"{NORMALIZED_BUNDLE_LABEL} TXT {bundle_no}번 / "
+                        f"{LABEL_LATEST_UPLOAD_REFLECTED} {updated}{role_tail}"
+                    )
+                return (
+                    f"{NORMALIZED_BUNDLE_LABEL} TXT / "
+                    f"{LABEL_LATEST_UPLOAD_REFLECTED} {updated}{role_tail}"
+                )
             if group == "xlsx":
                 bundle_no = int(res.get("row", 0) or res.get("line_start", 0) or 0)
                 if bundle_no > 0:
-                    return f"통합 정리 XLSX {bundle_no}번 / 최신 업로드 반영 {updated}{role_tail}"
-                return f"통합 정리 XLSX / 최신 업로드 반영 {updated}{role_tail}"
-            return f"통합 정리 {group.upper()} / 최신 업로드 반영 {updated}{role_tail}"
+                    return (
+                        f"{NORMALIZED_BUNDLE_LABEL} XLSX {bundle_no}번 / "
+                        f"{LABEL_LATEST_UPLOAD_REFLECTED} {updated}{role_tail}"
+                    )
+                return (
+                    f"{NORMALIZED_BUNDLE_LABEL} XLSX / "
+                    f"{LABEL_LATEST_UPLOAD_REFLECTED} {updated}{role_tail}"
+                )
+            return (
+                f"{NORMALIZED_BUNDLE_LABEL} {group.upper()} / "
+                f"{LABEL_LATEST_UPLOAD_REFLECTED} {updated}{role_tail}"
+            )
 
         source = (res.get("source_display", "") or res.get("source_path", "") or "").strip()
         updated = self._format_timestamp(int(res.get("uploaded_at", res.get("source_updated_at", 0)) or 0))
-        updated_tail = f" / 업로드 {updated}" if updated != "-" else ""
+        updated_tail = f" / {LABEL_UPLOAD} {updated}" if updated != "-" else ""
         section = (res.get("section", "") or "").strip()
         if res.get("sheet"):
             row = int(res.get("row", 0) or 0)
             row_end = int(res.get("row_end", row) or row)
             if row_end > row:
-                return f"{source} / {res.get('sheet')} / 행 {row}-{row_end}{updated_tail}{role_tail}"
-            return f"{source} / {res.get('sheet')} / 행 {row}{updated_tail}{role_tail}"
+                return (
+                    f"{source} / {res.get('sheet')} / "
+                    f"{LABEL_ROW} {row}-{row_end}{updated_tail}{role_tail}"
+                )
+            return f"{source} / {res.get('sheet')} / {LABEL_ROW} {row}{updated_tail}{role_tail}"
         if res.get("line_start"):
             line_start = int(res.get("line_start", 0) or 0)
             line_end = int(res.get("line_end", line_start) or line_start)
             if section:
-                return f"{source} / {section} / 라인 {line_start}-{line_end}{updated_tail}{role_tail}"
-            return f"{source} / 라인 {line_start}-{line_end}{updated_tail}{role_tail}"
+                return (
+                    f"{source} / {section} / "
+                    f"{LABEL_LINE} {line_start}-{line_end}{updated_tail}{role_tail}"
+                )
+            return f"{source} / {LABEL_LINE} {line_start}-{line_end}{updated_tail}{role_tail}"
         if section:
             return f"{source} / {section}{updated_tail}{role_tail}"
         if updated_tail:
@@ -5055,7 +6257,7 @@ class RAGEngine:
         lines = [ln.strip() for ln in re.split(r"\n+", text) if ln.strip()]
         parts: List[str] = []
         for line in lines:
-            segs = re.split(r"(?<=[\.\!\?。！？])\s+", line)
+            segs = _SENTENCE_SPLIT_RE.split(line)
             for seg in segs:
                 s = seg.strip()
                 if s:
@@ -5356,15 +6558,19 @@ class RAGEngine:
                 preview = preview[:120] + "..."
 
             if sheet:
-                location = f"{sheet} / 행 {row_start}-{row_end}" if row_end > row_start else f"{sheet} / 행 {row_start}"
+                location = (
+                    f"{sheet} / {LABEL_ROW} {row_start}-{row_end}"
+                    if row_end > row_start
+                    else f"{sheet} / {LABEL_ROW} {row_start}"
+                )
             elif section and line_start > 0:
-                location = f"{section} / 라인 {line_start}-{line_end}"
+                location = f"{section} / {LABEL_LINE} {line_start}-{line_end}"
             elif section:
                 location = section
             elif line_start > 0:
-                location = f"라인 {line_start}-{line_end}"
+                location = f"{LABEL_LINE} {line_start}-{line_end}"
             else:
-                location = "본문"
+                location = LABEL_BODY
 
             if location in seen_locations:
                 continue

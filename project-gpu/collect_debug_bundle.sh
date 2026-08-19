@@ -30,8 +30,25 @@ export COMPASSLM_DEBUG_AUTH_COOKIE="${COMPASSLM_DEBUG_AUTH_COOKIE:-}"
 export COMPASSLM_DEBUG_AUTH_COOKIE_NAME="${COMPASSLM_DEBUG_AUTH_COOKIE_NAME:-compass_auth_session}"
 export COMPASSLM_DEBUG_COOKIE_HEADER="${COMPASSLM_DEBUG_COOKIE_HEADER:-}"
 export COMPASSLM_BACKEND_LOG_PATH="${COMPASSLM_BACKEND_LOG_PATH:-}"
+if [[ -n "${COMPASSLM_DEBUG_PYTHON_BIN:-}" ]]; then
+  DEBUG_PYTHON_BIN="${COMPASSLM_DEBUG_PYTHON_BIN}"
+elif command -v python3 >/dev/null 2>&1 && python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 8) else 1)' >/dev/null 2>&1; then
+  DEBUG_PYTHON_BIN="python3"
+elif command -v python >/dev/null 2>&1 && python -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 8) else 1)' >/dev/null 2>&1; then
+  DEBUG_PYTHON_BIN="python"
+else
+  echo "[ERROR] Debug bundle requires Python 3.8+ as python3 or python. Set COMPASSLM_DEBUG_PYTHON_BIN=/path/to/python." >&2
+  exit 1
+fi
 
-python3 - <<'PY'
+# Authenticated ops endpoints need the same browser session used by CompassLM.
+# Examples:
+#   COMPASSLM_DEBUG_AUTH_COOKIE='cookie-value' bash ./project-gpu/collect_debug_bundle.sh
+#   COMPASSLM_DEBUG_COOKIE_HEADER='compass_auth_session=cookie-value; other=value' bash ./project-gpu/collect_debug_bundle.sh
+# Without one of those values, ops_failure_patterns_ok=false and api_auth_missing=true
+# are expected, and /ops/* plus /kbs/* API diagnostics will be omitted.
+
+"${DEBUG_PYTHON_BIN}" - <<'PY'
 import json
 import os
 import socket
@@ -47,7 +64,7 @@ LOGS_DIR = Path(os.environ["COMPASSLM_LOGS_DIR"]).resolve()
 APP_DB_PATH = Path(os.environ["COMPASSLM_APP_DB_PATH"]).resolve()
 KB_DATA_DIR = Path(os.environ["KB_DATA_DIR"]).resolve()
 API_BASE_URL = os.environ["COMPASSLM_DEBUG_API_BASE_URL"].rstrip("/")
-DEBUG_AUTH_TOKEN = os.environ.get("COMPASSLM_DEBUG_AUTH_TOKEN", "").strip()
+debug_auth_header_value = os.environ.get("COMPASSLM_DEBUG_AUTH_TOKEN", "").strip()
 DEBUG_AUTH_COOKIE = os.environ.get("COMPASSLM_DEBUG_AUTH_COOKIE", "").strip()
 DEBUG_AUTH_COOKIE_NAME = os.environ.get("COMPASSLM_DEBUG_AUTH_COOKIE_NAME", "compass_auth_session").strip() or "compass_auth_session"
 DEBUG_COOKIE_HEADER = os.environ.get("COMPASSLM_DEBUG_COOKIE_HEADER", "").strip()
@@ -135,8 +152,8 @@ def read_text_tail(path: Path, limit: int = 120) -> List[str]:
 
 def fetch_json(url: str, timeout: float = 5.0) -> Dict[str, Any]:
     headers = {"Accept": "application/json"}
-    if DEBUG_AUTH_TOKEN:
-        headers["Authorization"] = f"Bearer {DEBUG_AUTH_TOKEN}"
+    if debug_auth_header_value:
+        headers["Authorization"] = f"Bearer {debug_auth_header_value}"
     if DEBUG_COOKIE_HEADER:
         headers["Cookie"] = DEBUG_COOKIE_HEADER
     elif DEBUG_AUTH_COOKIE:
@@ -306,6 +323,74 @@ def build_kb_snapshot(kb_name: str) -> Dict[str, Any]:
         sqlite_rows(kb_db_path, answer_query, answer_params),
         ["citations_json", "answer_meta_json"],
     )
+    recent_no_evidence_reports = decode_fields(
+        sqlite_rows(
+            kb_db_path,
+            """
+            SELECT
+                f.feedback_id,
+                f.saved_answer_id,
+                f.answer_log_id,
+                f.query_id,
+                f.user_id,
+                f.feedback_type,
+                f.saved_to_wiki,
+                f.created_at,
+                a.question_text,
+                a.answer_summary,
+                a.answer_text,
+                a.citation_json,
+                a.status,
+                a.quality_flags_json
+            FROM wiki_answer_feedback f
+            LEFT JOIN wiki_saved_answers a ON a.saved_answer_id = f.saved_answer_id
+            WHERE f.feedback_type = 'report_citation_issue'
+            ORDER BY f.created_at DESC, f.feedback_id DESC
+            LIMIT 30
+            """,
+        ),
+        ["citation_json", "quality_flags_json"],
+    )
+    recent_reported_ontology_facts = decode_fields(
+        sqlite_rows(
+            kb_db_path,
+            """
+            SELECT
+                f.fact_id,
+                f.kb_id,
+                subj.display_text AS subject_text,
+                f.predicate,
+                obj.display_text AS object_text,
+                f.object_value,
+                f.fact_kind,
+                f.extraction_method,
+                f.confidence,
+                f.status,
+                f.created_at,
+                f.updated_at,
+                (
+                    SELECT json_group_array(json_object(
+                        'chunk_id', s.chunk_id,
+                        'source_path', s.source_path,
+                        'source_ref', s.source_ref,
+                        'page_no', s.page_no,
+                        'line_start', s.line_start,
+                        'line_end', s.line_end,
+                        'evidence_quote', s.evidence_quote
+                    ))
+                    FROM ontology_fact_sources s
+                    WHERE s.fact_id = f.fact_id
+                ) AS sources_json
+            FROM ontology_facts f
+            LEFT JOIN ontology_entities subj ON subj.entity_id = f.subject_entity_id
+            LEFT JOIN ontology_entities obj ON obj.entity_id = f.object_entity_id
+            WHERE f.status IN ('reported', 'needs_review')
+            ORDER BY f.updated_at DESC, f.fact_id DESC
+            LIMIT 30
+            """,
+        ),
+        ["sources_json"],
+    )
 
     latest_activity_at = max(
         coerce_int(sqlite_value(APP_DB_PATH, "SELECT MAX(created_at) FROM chat_messages WHERE kb_name = ?", (kb_name,))),
@@ -328,7 +413,7 @@ def build_kb_snapshot(kb_name: str) -> Dict[str, Any]:
         ),
     )
 
-    return {
+    snapshot = {
         "kb_name": kb_name,
         "kb_db_path": str(kb_db_path),
         "latest_session_id": latest_session_id or "",
@@ -340,7 +425,73 @@ def build_kb_snapshot(kb_name: str) -> Dict[str, Any]:
         "recent_agent_runs": recent_agent_runs,
         "recent_retrieval_logs": recent_retrieval_logs,
         "recent_answer_logs": recent_answer_logs,
+        "recent_no_evidence_reports": recent_no_evidence_reports,
+        "recent_reported_ontology_facts": recent_reported_ontology_facts,
         "api_results": api_results,
+    }
+    snapshot["validator_diagnostics"] = summarize_validator_diagnostics(recent_agent_runs)
+    return snapshot
+
+
+def summarize_validator_diagnostics(runs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    validator_counts: Dict[str, int] = {}
+    retry_counts: Dict[str, int] = {}
+    final_issue_counts: Dict[str, int] = {}
+    repair_applied_count = 0
+    answer_stream_fail_count = 0
+    no_evidence_fallback_count = 0
+    recent_failures: List[Dict[str, Any]] = []
+    for row in runs:
+        metadata = row.get("metadata_json") if isinstance(row.get("metadata_json"), dict) else {}
+        issue = str(row.get("response_quality_issue") or metadata.get("response_quality_issue") or "").strip()
+        failure_code = str(metadata.get("failure_code") or "").strip()
+        if issue == "answer_stream_fail" or failure_code == "answer_stream_fail":
+            answer_stream_fail_count += 1
+        answer_text = str(row.get("answer_text") or "")
+        if "문서 근거" in answer_text and "부족" in answer_text:
+            no_evidence_fallback_count += 1
+        if bool(metadata.get("validator_repair_applied")):
+            repair_applied_count += 1
+        for key, value in (metadata.get("validator_counts") or {}).items():
+            validator_counts[str(key)] = validator_counts.get(str(key), 0) + coerce_int(value)
+        for key, value in (metadata.get("validator_retry_counts") or {}).items():
+            retry_counts[str(key)] = retry_counts.get(str(key), 0) + coerce_int(value)
+        final_issue = str(metadata.get("final_validator_issue") or "").strip()
+        if final_issue:
+            final_issue_counts[truncate_text(final_issue, 160)] = final_issue_counts.get(truncate_text(final_issue, 160), 0) + 1
+        phase_events = metadata.get("phase_events") if isinstance(metadata.get("phase_events"), list) else []
+        for event in phase_events:
+            payload = event.get("payload") if isinstance(event, dict) else {}
+            payload = payload if isinstance(payload, dict) else {}
+            validator = str(payload.get("validator") or "").strip()
+            if validator:
+                validator_counts[validator] = validator_counts.get(validator, 0) + 1
+                if validator in {"citation", "tool_recheck", "numeric_recheck", "outline_recheck", "quality_checker"}:
+                    retry_counts[validator] = retry_counts.get(validator, 0) + 1
+                if validator in {"answer_format_repair", "citation_repair", "answer_sanitizer"}:
+                    repair_applied_count += 1
+        if issue or failure_code:
+            recent_failures.append(
+                {
+                    "run_id": row.get("run_id"),
+                    "query_id": row.get("query_id"),
+                    "user_message": truncate_text(row.get("user_message")),
+                    "response_quality_issue": issue,
+                    "failure_code": failure_code,
+                    "last_validator": str(metadata.get("last_validator") or ""),
+                    "validator_repair_applied": bool(metadata.get("validator_repair_applied")),
+                    "final_validator_issue": truncate_text(metadata.get("final_validator_issue"), 240),
+                    "answer_preview": truncate_text(row.get("answer_text"), 240),
+                }
+            )
+    return {
+        "validator_counts": dict(sorted(validator_counts.items(), key=lambda item: (-item[1], item[0]))),
+        "validator_retry_counts": dict(sorted(retry_counts.items(), key=lambda item: (-item[1], item[0]))),
+        "final_validator_issue_counts": dict(sorted(final_issue_counts.items(), key=lambda item: (-item[1], item[0]))[:12]),
+        "validator_repair_applied_count": int(repair_applied_count),
+        "answer_stream_fail_count": int(answer_stream_fail_count),
+        "no_evidence_fallback_count": int(no_evidence_fallback_count),
+        "recent_failures": recent_failures[:20],
     }
 
 
@@ -416,8 +567,29 @@ if backend_log_path is None:
 if not kb_db_path.exists():
     warnings.append(f"kb_db_missing:{kb_db_path}")
 
+runtime_latest_path_file = PROJECT_ROOT / "logs" / "runtime" / "latest_path.txt"
+runtime_log_dir = ""
+runtime_startup_summary: Dict[str, Any] = {}
+runtime_logs: Dict[str, List[str]] = {}
+if runtime_latest_path_file.exists():
+    try:
+        runtime_log_dir = runtime_latest_path_file.read_text(encoding="utf-8", errors="replace").splitlines()[0].strip()
+    except Exception as exc:
+        warnings.append(f"runtime_latest_path_read_fail:{exc}")
+        runtime_log_dir = ""
+runtime_log_path = Path(runtime_log_dir) if runtime_log_dir else None
+if runtime_log_path and runtime_log_path.exists():
+    startup_summary_path = runtime_log_path / "startup_summary.json"
+    if startup_summary_path.exists():
+        try:
+            runtime_startup_summary = json.loads(startup_summary_path.read_text(encoding="utf-8", errors="replace"))
+        except Exception as exc:
+            runtime_startup_summary = {"_error": f"startup_summary_read_fail:{exc}"}
+    for log_name in ("assets.log", "embedding.log", "llm.log", "backend.log", "monitor.log"):
+        runtime_logs[log_name] = read_text_tail(runtime_log_path / log_name, limit=120)
+
 api_results = dict(primary_snapshot.get("api_results") or {})
-api_auth_configured = bool(DEBUG_AUTH_TOKEN or DEBUG_AUTH_COOKIE or DEBUG_COOKIE_HEADER)
+api_auth_configured = bool(debug_auth_header_value or DEBUG_AUTH_COOKIE or DEBUG_COOKIE_HEADER)
 api_auth_missing = (not api_auth_configured) and any(
     int(result.get("status_code", 0) or 0) == 401
     for result in api_results.values()
@@ -433,7 +605,7 @@ startup_snapshot = {
     "kb_data_dir": str(KB_DATA_DIR),
     "kb_db_path": str(kb_db_path),
     "api_base_url": API_BASE_URL,
-    "api_auth_token_configured": bool(DEBUG_AUTH_TOKEN),
+    "api_auth_token_configured": bool(debug_auth_header_value),
     "api_auth_cookie_configured": bool(DEBUG_AUTH_COOKIE or DEBUG_COOKIE_HEADER),
     "api_host": os.environ.get("API_HOST", ""),
     "api_port": os.environ.get("API_PORT", ""),
@@ -458,6 +630,8 @@ startup_snapshot = {
         {"path": str(Path(os.environ["PROJECT_GPU_HOME"]) / "runtime.env"), "exists": (Path(os.environ["PROJECT_GPU_HOME"]) / "runtime.env").exists()},
         {"path": str(Path(os.environ["MAIN_BACKEND_HOME"]) / ".env"), "exists": (Path(os.environ["MAIN_BACKEND_HOME"]) / ".env").exists()},
     ],
+    "runtime_log_dir": runtime_log_dir,
+    "runtime_startup_summary": runtime_startup_summary,
 }
 
 summary = {
@@ -472,6 +646,9 @@ summary = {
     "recent_agent_run_count": len(recent_agent_runs),
     "recent_retrieval_log_count": len(recent_retrieval_logs),
     "recent_answer_log_count": len(recent_answer_logs),
+    "recent_no_evidence_report_count": len(list(primary_snapshot.get("recent_no_evidence_reports") or [])),
+    "recent_reported_ontology_fact_count": len(list(primary_snapshot.get("recent_reported_ontology_facts") or [])),
+    "validator_diagnostics": dict(primary_snapshot.get("validator_diagnostics") or {}),
     "admin_feedback_tail_count": len(admin_feedback_entries),
     "rag_trace_tail_count": len(rag_trace_entries),
     "latest_session_id": latest_session_id or "",
@@ -500,11 +677,15 @@ bundle = {
     "recent_agent_runs": recent_agent_runs,
     "recent_retrieval_logs": recent_retrieval_logs,
     "recent_answer_logs": recent_answer_logs,
+    "recent_no_evidence_reports": list(primary_snapshot.get("recent_no_evidence_reports") or []),
+    "recent_reported_ontology_facts": list(primary_snapshot.get("recent_reported_ontology_facts") or []),
     "log_tails": {
         "admin_feedback": admin_feedback_entries,
         "rag_trace": rag_trace_entries,
         "backend_log_path": str(backend_log_path) if backend_log_path else "",
         "backend_log_tail": backend_log_tail,
+        "runtime_log_dir": runtime_log_dir,
+        "runtime_logs": runtime_logs,
     },
     "summary": summary,
     "warnings": warnings,

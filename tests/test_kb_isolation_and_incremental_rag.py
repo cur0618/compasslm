@@ -201,7 +201,7 @@ class IncrementalRAGTests(unittest.TestCase):
         conn.close()
         self.assertIsNotNone(row)
         self.assertIn("농가경제조사", row[0])
-        self.assertIn("경로: 지급기준", row[1])
+        self.assertIn("path=지급기준", row[1])
         self.assertEqual(row[2], "table_row")
         self.assertEqual(row[3], '["지급기준"]')
         self.assertTrue(row[4])
@@ -326,6 +326,41 @@ class KBEngineRegistryTests(unittest.TestCase):
         self.assertEqual(list(registry._instances.keys()), ["test2"])
         first.close.assert_called_once()
         self.assertFalse(second.close.called)
+
+    def test_registry_lease_prevents_eviction_until_request_finishes(self):
+        from src.kb_engine_registry import KBEngineRegistry
+
+        registry = KBEngineRegistry(max_loaded_kbs=1, idle_ttl_seconds=3600)
+
+        def factory(kb_name: str):
+            return SimpleNamespace(kb_id=kb_name, close=MagicMock())
+
+        with registry.lease("test1", factory) as first:
+            second = registry.get_or_create("test2", factory)
+            self.assertFalse(first.close.called)
+            self.assertFalse(second.close.called)
+            self.assertEqual(registry.snapshot_count(), 2)
+
+        first.close.assert_called_once()
+        self.assertEqual(list(registry._instances.keys()), ["test2"])
+        self.assertFalse(second.close.called)
+
+    def test_remove_defers_close_for_a_leased_engine(self):
+        from src.kb_engine_registry import KBEngineRegistry
+
+        registry = KBEngineRegistry(max_loaded_kbs=1, idle_ttl_seconds=3600)
+
+        def factory(kb_name: str):
+            return SimpleNamespace(kb_id=kb_name, close=MagicMock())
+
+        with registry.lease("test1", factory) as first:
+            registry.remove("test1")
+            self.assertFalse(first.close.called)
+            replacement = registry.get_or_create("test1", factory)
+            self.assertIsNot(first, replacement)
+
+        first.close.assert_called_once()
+        self.assertFalse(replacement.close.called)
 
 
 if __name__ == "__main__":

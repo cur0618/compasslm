@@ -59,6 +59,19 @@ class AuthStoreTests(unittest.TestCase):
             store.set_user_active(user["user_id"], False)
             self.assertIsNone(store.get_user_by_session(active))
 
+    def test_prune_expired_sessions_keeps_active_sessions(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = AuthStore(str(Path(td) / "app.sqlite"))
+            user = store.create_user("writer", "pw", role="user")
+            expired = store.create_session(user["user_id"], ttl_seconds=-10)
+            active = store.create_session(user["user_id"], ttl_seconds=600)
+
+            removed = store.prune_expired_sessions(now_ts=int(time.time()), limit=100)
+
+            self.assertEqual(removed, 1)
+            self.assertIsNone(store.get_user_by_session(expired))
+            self.assertIsNotNone(store.get_user_by_session(active))
+
     def test_kbs_are_listed_only_for_their_owner(self):
         with tempfile.TemporaryDirectory() as td:
             store = AuthStore(str(Path(td) / "app.sqlite"))
@@ -113,6 +126,34 @@ class AuthStoreTests(unittest.TestCase):
             self.assertEqual(synced["internal_kb_id"], "default")
             self.assertEqual(renamed["kb_id"], original["kb_id"])
             self.assertEqual([kb["display_name"] for kb in store.list_kbs(admin["user_id"])], ["운영 지침서"])
+
+    def test_recreating_soft_deleted_kb_uses_fresh_identity(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = AuthStore(str(Path(td) / "app.sqlite"))
+            user = store.create_user("alice", "pw")
+            original = store.create_kb(user["user_id"], "지침서공간")
+
+            self.assertTrue(store.soft_delete_kb(user["user_id"], "지침서공간"))
+            recreated = store.create_kb(user["user_id"], "지침서공간")
+
+            self.assertEqual(recreated["display_name"], "지침서공간")
+            self.assertNotEqual(recreated["kb_id"], original["kb_id"])
+            self.assertNotEqual(recreated["internal_kb_id"], original["internal_kb_id"])
+            self.assertTrue(recreated["internal_kb_id"].startswith(original["internal_kb_id"] + "__"))
+            self.assertEqual(store.get_kb(user["user_id"], "지침서공간")["kb_id"], recreated["kb_id"])
+
+    def test_legacy_sync_can_restore_soft_deleted_explicit_internal_id(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = AuthStore(str(Path(td) / "app.sqlite"))
+            admin = store.create_user("admin", "pw", role="admin")
+            original = store.create_kb(admin["user_id"], "legacy", internal_kb_id="legacy")
+
+            self.assertTrue(store.soft_delete_kb(admin["user_id"], "legacy"))
+            restored = store.create_kb(admin["user_id"], "legacy", internal_kb_id="legacy")
+
+            self.assertEqual(restored["kb_id"], original["kb_id"])
+            self.assertEqual(restored["internal_kb_id"], "legacy")
+            self.assertEqual(store.get_kb(admin["user_id"], "legacy")["kb_id"], original["kb_id"])
 
     def test_create_kb_rejects_internal_id_owned_by_another_user_without_leaking_lock(self):
         with tempfile.TemporaryDirectory() as td:

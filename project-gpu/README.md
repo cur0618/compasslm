@@ -239,3 +239,31 @@ JupyterHub 등의 사용자별 reverse proxy를 통할 때 경로 예시는
 1. backend `[READY]` 로그에 출력된 URL로 접속
 2. `.txt`/`.xlsx` 업로드
 3. 질문 입력 후 근거 포함 응답 확인
+## 9) 통합 실행 권장 방식
+
+Jupyter GPU 환경에서는 tmux 기반 통합 실행기를 권장한다.
+
+```bash
+cd ~/compasslm
+project-gpu/compass_up.sh
+```
+
+기존 `run_embedding_server.sh`, `run_llm_server.sh`, `run_backend_api.sh`를 재사용해
+`embedding -> LLM -> backend` 순서로 시작한다. 임베딩과 LLM이 runtime state와
+health probe에서 준비된 뒤에만 backend를 시작한다. 특히 LLM은 선택된 URL/PID를
+`ports.env`에 기록하고 `/v1/models` 검사를 통과해야 한다.
+
+운영 보조 명령:
+
+```bash
+project-gpu/compass_status.sh
+project-gpu/compass_status.sh --json
+project-gpu/compass_logs.sh backend -f
+project-gpu/compass_down.sh
+tmux attach -t compasslm
+```
+
+로그는 `logs/runtime/YYYYMMDD_HHMMSS/`에 기록한다. `startup_summary.json`에는
+선택 포트, PID, 로컬 URL, 끝에 `/`가 붙은 Jupyter proxy URL, 시작 상태와 실패
+단계가 남는다. `tmux`가 없다면 `sudo apt-get install -y tmux` 또는
+`conda install -c conda-forge tmux`로 설치한다.

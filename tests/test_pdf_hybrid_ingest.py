@@ -648,6 +648,46 @@ class HybridPdfIngestTests(unittest.TestCase):
         self.assertEqual(meta["total_pages"], 160)
         self.assertEqual(meta["ocr_completed_pages"], 159)
 
+    def test_fast_ocr_warmup_loads_only_fast_model_in_backend_process(self):
+        pdf_module = _load_module(
+            "codex_test_pdf_fast_backend_warmup",
+            PDF_OCR_PATH,
+            extra_modules={},
+        )
+        fast_calls = []
+        vl_calls = []
+
+        def _fail_process_pool(*args, **kwargs):
+            raise AssertionError("fast OCR warmup must not create the VL process pool")
+
+        with mock.patch.object(pdf_module.concurrent.futures, "ProcessPoolExecutor", _fail_process_pool):
+            with mock.patch.object(
+                pdf_module,
+                "_load_fast_ocr_model",
+                lambda device=None: fast_calls.append(device) or object(),
+            ):
+                with mock.patch.object(
+                    pdf_module,
+                    "_load_ocr_model",
+                    lambda *args, **kwargs: vl_calls.append((args, kwargs)) or object(),
+                ):
+                    with mock.patch.dict(
+                        os.environ,
+                        {
+                            "PDF_OCR_BACKEND": "ppocr_fast_v1",
+                            "PDF_OCR_FAST_DEVICE": "gpu:0",
+                            "PDF_OCR_DEVICE": "gpu:0",
+                        },
+                        clear=False,
+                    ):
+                        result = pdf_module.warmup_persistent_ocr_worker()
+
+        self.assertEqual(fast_calls, ["gpu:0"])
+        self.assertEqual(vl_calls, [])
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(result["backend"], "ppocr_fast_v1")
+        self.assertEqual(result["execution_scope"], "backend_process")
+
     def test_persistent_gpu_ocr_warmup_loads_model_once_in_worker(self):
         pdf_module = _load_module(
             "codex_test_pdf_persistent_worker_warmup",
@@ -678,6 +718,7 @@ class HybridPdfIngestTests(unittest.TestCase):
                 with mock.patch.dict(
                     os.environ,
                     {
+                        "PDF_OCR_BACKEND": "vl_only",
                         "PDF_OCR_DEVICE": "gpu:0",
                         "PDF_OCR_GPU_PROCESS_ISOLATION": "1",
                         "PDF_OCR_PERSISTENT_WORKER": "1",
@@ -729,6 +770,7 @@ class HybridPdfIngestTests(unittest.TestCase):
             with mock.patch.dict(
                 os.environ,
                 {
+                    "PDF_OCR_BACKEND": "vl_only",
                     "PDF_OCR_DEVICE": "gpu:0",
                     "PDF_OCR_GPU_PROCESS_ISOLATION": "1",
                     "PDF_OCR_PERSISTENT_WORKER": "1",
@@ -774,6 +816,7 @@ class HybridPdfIngestTests(unittest.TestCase):
             with mock.patch.dict(
                 os.environ,
                 {
+                    "PDF_OCR_BACKEND": "vl_only",
                     "PDF_OCR_DEVICE": "gpu:0",
                     "PDF_OCR_GPU_PROCESS_ISOLATION": "1",
                     "PDF_OCR_PERSISTENT_WORKER": "1",
@@ -787,6 +830,41 @@ class HybridPdfIngestTests(unittest.TestCase):
                         device="gpu:0",
                         timeout_seconds=1,
                     )
+
+    def test_persistent_worker_cache_identity_includes_backend(self):
+        pdf_module = _load_module(
+            "codex_test_pdf_persistent_worker_backend_identity",
+            PDF_OCR_PATH,
+            extra_modules={},
+        )
+        executors = []
+
+        class _FakeExecutor:
+            def __init__(self, max_workers=None, mp_context=None):
+                self.shutdown_calls = 0
+                executors.append(self)
+
+            def shutdown(self, wait=True, cancel_futures=False):
+                self.shutdown_calls += 1
+
+        with mock.patch.object(pdf_module.concurrent.futures, "ProcessPoolExecutor", _FakeExecutor):
+            first = pdf_module._ensure_persistent_ocr_worker(
+                model_name="mock-model",
+                device="gpu:0",
+                requested_workers=1,
+                backend="vl_only",
+            )
+            second = pdf_module._ensure_persistent_ocr_worker(
+                model_name="mock-model",
+                device="gpu:0",
+                requested_workers=1,
+                backend="ppocr_fast_v1",
+            )
+            pdf_module.shutdown_persistent_ocr_worker()
+
+        self.assertIsNot(first, second)
+        self.assertEqual(len(executors), 2)
+        self.assertEqual(executors[0].shutdown_calls, 1)
 
     def test_ocr_batch_submission_is_bounded_by_worker_count(self):
         pdf_module = _load_module(
@@ -1556,6 +1634,7 @@ class HybridPdfIngestTests(unittest.TestCase):
                 with mock.patch.dict(
                     os.environ,
                     {
+                        "PDF_OCR_BACKEND": "vl_only",
                         "PDF_OCR_DEVICE": "gpu:0",
                         "PDF_OCR_MAX_PAGES": "200",
                         "PDF_OCR_TARGET_PAGES": "200",
@@ -1596,6 +1675,7 @@ class HybridPdfIngestTests(unittest.TestCase):
                 with mock.patch.dict(
                     os.environ,
                     {
+                        "PDF_OCR_BACKEND": "vl_only",
                         "PDF_OCR_DEVICE": "gpu:0",
                         "PDF_OCR_MAX_PAGES": "2",
                     },
@@ -1609,6 +1689,127 @@ class HybridPdfIngestTests(unittest.TestCase):
         self.assertEqual(runtime_info["ocr_batch_count"], 2)
         self.assertEqual(runtime_info["ocr_model_load_seconds"], 3.0)
         self.assertEqual(runtime_info["ocr_predict_seconds"], 12.0)
+
+    def test_ppocr_fast_definition_reconstruction_pairs_terms_and_descriptions(self):
+        pdf_module = _load_module(
+            "codex_test_pdf_ocr_fast_definition_reconstruction",
+            PDF_OCR_PATH,
+            extra_modules={},
+        )
+
+        lines = []
+        for text, bbox in [
+            ("논", [20, 10, 70, 26]),
+            ("물을 이용하여 벼를 재배하는 농지", [120, 10, 360, 26]),
+            ("일모작", [20, 38, 90, 54]),
+            ("동일한 경작지에서 한 해에 한 차례만 작물을 거두는 일", [120, 38, 520, 54]),
+            ("이모작", [20, 66, 90, 82]),
+            ("동일한 경작지에서 한 해에 두 차례 다른 작물을 거두는 일", [120, 66, 540, 82]),
+            ("작물을 재배하는 농지입니다.", [120, 86, 390, 102]),
+        ]:
+            pdf_module._append_fast_line(lines, text=text, score=0.98, bbox=bbox, page_no=1)
+
+        text, metrics = pdf_module._reconstruct_definition_page(lines)
+
+        self.assertIn("정의: 논", text)
+        self.assertIn("설명: 물을 이용하여 벼를 재배하는 농지", text)
+        self.assertIn("정의: 일모작", text)
+        self.assertIn("정의: 이모작", text)
+        self.assertIn("작물을 재배하는 농지입니다.", text)
+        self.assertGreaterEqual(metrics["pair_ratio"], 0.6)
+        self.assertLess(metrics["orphan_ratio"], 0.3)
+
+    def test_ppocr_fast_backend_is_default_and_does_not_auto_vl_fallback(self):
+        pdf_module = _load_module(
+            "codex_test_pdf_ocr_fast_default_backend",
+            PDF_OCR_PATH,
+            extra_modules={},
+        )
+
+        class _FastModel:
+            def predict(self, input=None, page_num=None):
+                return [
+                    ([20, 10, 70, 26], ("논", 0.99)),
+                    ([120, 10, 360, 26], ("물을 이용하여 벼를 재배하는 농지", 0.99)),
+                    ([20, 38, 90, 54], ("일모작", 0.99)),
+                    ([120, 38, 520, 54], ("동일한 경작지에서 한 해에 한 차례만 작물을 거두는 일", 0.99)),
+                ]
+
+        pdf_module._count_pdf_pages = lambda path: 1
+        pdf_module._load_fast_ocr_model = lambda device=None: _FastModel()
+        vl_calls = []
+        pdf_module._execute_local_paddleocr_vl_with_runtime = lambda *args, **kwargs: vl_calls.append(args) or ([], {})
+
+        with tempfile.NamedTemporaryFile(suffix=".pdf") as tmp_pdf:
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "PDF_OCR_BACKEND": "",
+                    "PDF_OCR_FAST_MIN_TEXT_CHARS": "1",
+                    "PDF_OCR_FAST_VL_FALLBACK": "0",
+                },
+                clear=False,
+            ):
+                pages, runtime_info = pdf_module._execute_paddleocr_vl_with_runtime(tmp_pdf.name)
+
+        self.assertEqual(runtime_info["ocr_backend_effective"], "ppocr_fast_v1")
+        self.assertEqual(runtime_info["ocr_fast_pages"], 1)
+        self.assertEqual(runtime_info["ocr_vl_pages"], 0)
+        self.assertFalse(runtime_info["ocr_high_quality_requested"])
+        self.assertFalse(vl_calls)
+        self.assertIn("정의: 논", pages[0]["text"])
+
+    def test_paddleocr_vl_helper_forces_vl_only_even_when_fast_is_default(self):
+        pdf_module = _load_module(
+            "codex_test_pdf_ocr_vl_helper_forces_vl_only",
+            PDF_OCR_PATH,
+            extra_modules={},
+        )
+
+        fast_calls = []
+        pdf_module._execute_ppocr_fast_v1_with_runtime = lambda *args, **kwargs: fast_calls.append(args) or ([], {})
+        pdf_module._execute_local_paddleocr_vl_with_runtime = lambda *args, **kwargs: (
+            [{"page_no": 1, "text": "vl page", "parser": "paddleocr_vl"}],
+            {"ocr_backend": "vl_only"},
+        )
+
+        with tempfile.NamedTemporaryFile(suffix=".pdf") as tmp_pdf:
+            with mock.patch.dict(os.environ, {"PDF_OCR_BACKEND": "ppocr_fast_v1"}, clear=False):
+                pages = pdf_module.extract_pdf_pages_with_paddleocr_vl(tmp_pdf.name)
+
+        self.assertEqual(pages, [{"page_no": 1, "text": "vl page", "parser": "paddleocr_vl"}])
+        self.assertFalse(fast_calls)
+
+    def test_high_quality_pdf_ocr_mode_selects_vl_only_backend(self):
+        pdf_module = _load_module(
+            "codex_test_pdf_ocr_high_quality_mode",
+            PDF_OCR_PATH,
+            extra_modules={},
+        )
+
+        pdf_module._count_pdf_pages = lambda path: 1
+        pdf_module._extract_text_pages_with_pymupdf = lambda *args, **kwargs: []
+        pdf_module._execute_local_paddleocr_vl_with_runtime = lambda *args, **kwargs: (
+            [{"page_no": 1, "text": "vl page", "parser": "paddleocr_vl"}],
+            {
+                "ocr_backend": "vl_only",
+                "ocr_backend_effective": "vl_only",
+                "ocr_pages_attempted": 1,
+                "ocr_pages_emitted": 1,
+            },
+        )
+
+        with tempfile.NamedTemporaryFile(suffix=".pdf") as tmp_pdf:
+            result = pdf_module.extract_pdf_pages(
+                tmp_pdf.name,
+                force_upload_ocr=True,
+                pdf_ocr_mode="high_quality",
+            )
+
+        self.assertEqual(result["ocr_backend_effective"], "vl_only")
+        self.assertTrue(result["ocr_high_quality_requested"])
+        self.assertEqual(result["ocr_vl_pages"], 1)
+        self.assertEqual(result["pages"][0]["parser"], "paddleocr_vl")
 
     def test_gpu_ocr_error_detection_covers_oom_and_init_failures(self):
         pdf_module = _load_module(
@@ -1746,7 +1947,10 @@ class HybridPdfIngestTests(unittest.TestCase):
             calls.append("pymupdf")
             return {"pages": [{"page_no": 1, "text": "PyMuPDF text", "parser": "pymupdf_text"}], "total_pages": 1}
 
-        pdf_module.extract_pdf_pages_with_paddleocr_vl = _fake_ocr
+        pdf_module._execute_paddleocr_vl_with_runtime = lambda *args, **kwargs: (
+            _fake_ocr(*args, **kwargs),
+            {"ocr_backend": "vl_only", "ocr_backend_effective": "vl_only", "ocr_vl_pages": 1},
+        )
         pdf_module._extract_pdf_pages_with_pymupdf = _fake_pymupdf
         pdf_module._count_pdf_pages = lambda path: 1
 
@@ -1782,7 +1986,10 @@ class HybridPdfIngestTests(unittest.TestCase):
             calls.append("pymupdf")
             return {"pages": [{"page_no": 1, "text": "PyMuPDF fallback text", "parser": "pymupdf_text"}], "total_pages": 1}
 
-        pdf_module.extract_pdf_pages_with_paddleocr_vl = _fake_ocr
+        pdf_module._execute_paddleocr_vl_with_runtime = lambda *args, **kwargs: (
+            _fake_ocr(*args, **kwargs),
+            {"ocr_backend": "vl_only", "ocr_backend_effective": "vl_only", "ocr_vl_pages": 0},
+        )
         pdf_module._extract_pdf_pages_with_pymupdf = _fake_pymupdf
         pdf_module._count_pdf_pages = lambda path: 1
 
@@ -1806,7 +2013,10 @@ class HybridPdfIngestTests(unittest.TestCase):
         def _fake_ocr(*args, **kwargs):
             raise RuntimeError("CUDA error: no kernel image is available for execution on the device")
 
-        pdf_module.extract_pdf_pages_with_paddleocr_vl = _fake_ocr
+        pdf_module._execute_paddleocr_vl_with_runtime = lambda *args, **kwargs: (
+            _fake_ocr(*args, **kwargs),
+            {"ocr_backend": "vl_only", "ocr_backend_effective": "vl_only", "ocr_vl_pages": 0},
+        )
         pdf_module._count_pdf_pages = lambda path: 1
 
         with tempfile.NamedTemporaryFile(suffix=".pdf") as tmp_pdf:
@@ -1838,7 +2048,10 @@ class HybridPdfIngestTests(unittest.TestCase):
                 "total_pages": 3,
             }
 
-        pdf_module.extract_pdf_pages_with_paddleocr_vl = _fake_ocr
+        pdf_module._execute_paddleocr_vl_with_runtime = lambda *args, **kwargs: (
+            _fake_ocr(*args, **kwargs),
+            {"ocr_backend": "vl_only", "ocr_backend_effective": "vl_only", "ocr_vl_pages": 2},
+        )
         pdf_module._extract_pdf_pages_with_pymupdf = _fake_pymupdf
         pdf_module._count_pdf_pages = lambda path: 3
 
@@ -1954,6 +2167,10 @@ class HybridPdfIngestTests(unittest.TestCase):
             PDF_OCR_PATH,
             extra_modules={},
         )
+        pdf_module._execute_paddleocr_vl_with_runtime = lambda *args, **kwargs: (
+            pdf_module.extract_pdf_pages_with_paddleocr_vl(*args, **kwargs),
+            {"ocr_backend": "vl_only", "ocr_backend_effective": "vl_only", "ocr_vl_pages": 1},
+        )
         pdf_module.extract_pdf_pages_with_paddleocr_vl = lambda *args, **kwargs: [
             {"page_no": 2, "text": "둘째 페이지 OCR 텍스트"},
         ]
@@ -1988,6 +2205,10 @@ class HybridPdfIngestTests(unittest.TestCase):
             "codex_test_pdf_hybrid_table_ocr",
             PDF_OCR_PATH,
             extra_modules={},
+        )
+        pdf_module._execute_paddleocr_vl_with_runtime = lambda *args, **kwargs: (
+            pdf_module.extract_pdf_pages_with_paddleocr_vl(*args, **kwargs),
+            {"ocr_backend": "vl_only", "ocr_backend_effective": "vl_only", "ocr_vl_pages": 1},
         )
         pdf_module.extract_pdf_pages_with_paddleocr_vl = lambda *args, **kwargs: [
             {
@@ -2089,6 +2310,10 @@ class HybridPdfIngestTests(unittest.TestCase):
             PDF_OCR_PATH,
             extra_modules={},
         )
+        pdf_module._execute_paddleocr_vl_with_runtime = lambda *args, **kwargs: (
+            pdf_module.extract_pdf_pages_with_paddleocr_vl(*args, **kwargs),
+            {"ocr_backend": "vl_only", "ocr_backend_effective": "vl_only", "ocr_vl_pages": 1},
+        )
         ocr_paths: list[str] = []
 
         def _fake_ocr(path, **kwargs):
@@ -2125,6 +2350,10 @@ class HybridPdfIngestTests(unittest.TestCase):
             "codex_test_pdf_hybrid_partial_success",
             PDF_OCR_PATH,
             extra_modules={},
+        )
+        pdf_module._execute_paddleocr_vl_with_runtime = lambda *args, **kwargs: (
+            pdf_module.extract_pdf_pages_with_paddleocr_vl(*args, **kwargs),
+            {"ocr_backend": "vl_only", "ocr_backend_effective": "vl_only", "ocr_vl_pages": 0},
         )
         pdf_module.extract_pdf_pages_with_paddleocr_vl = lambda *args, **kwargs: (_ for _ in ()).throw(
             RuntimeError("PaddleOCR-VL PDF 인식 실패: timeout")
@@ -2220,6 +2449,10 @@ class HybridPdfIngestTests(unittest.TestCase):
             "codex_test_pdf_hybrid_disabled_text_extractor",
             PDF_OCR_PATH,
             extra_modules={},
+        )
+        pdf_module._execute_paddleocr_vl_with_runtime = lambda *args, **kwargs: (
+            pdf_module.extract_pdf_pages_with_paddleocr_vl(*args, **kwargs),
+            {"ocr_backend": "vl_only", "ocr_backend_effective": "vl_only", "ocr_vl_pages": 1},
         )
         pdf_module.extract_pdf_pages_with_paddleocr_vl = lambda *args, **kwargs: [
             {"page_no": 1, "text": "OCR 전용 텍스트"},
@@ -2348,6 +2581,7 @@ class HybridPdfIngestTests(unittest.TestCase):
         engine._compute_file_hash = lambda path: "abc123def456"
         engine._load_cached_payload = lambda **kwargs: None
         engine._save_cached_payload = lambda **kwargs: None
+        engine._find_previous_source_records = lambda source_path, original_filename: []
         engine._upsert_file_record = lambda **kwargs: 1
         engine._upsert_document_record = lambda **kwargs: captured_doc_meta.update(kwargs) or 2
         engine._replace_canonical_rows = lambda **kwargs: None
@@ -3189,6 +3423,151 @@ class PdfTwoPhaseIngestTests(unittest.TestCase):
             self.assertLess(events.index("ocr"), events.index("index"))
             self.assertEqual(self._chunk_count(engine), 1)
 
+    def test_reupload_with_same_original_name_replaces_one_logical_source(self):
+        events: list[str] = []
+        rag_module = self._load_rag_module(events)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            first_path = Path(tmpdir) / "20260731_090000_a1_sample.pdf"
+            second_path = Path(tmpdir) / "20260731_091000_b2_sample.pdf"
+            first_path.write_bytes(b"%PDF-1.4\nfirst")
+            second_path.write_bytes(b"%PDF-1.4\nsecond")
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "RAG_SQLITE_DENSE_ENABLED": "0",
+                    "RAG_HNSW_ENABLED": "0",
+                    "RAG_CONCEPT_LINKS_ENABLED": "0",
+                    "DOCUMENT_UPLOAD_ONTOLOGY_JOB_ENABLED": "0",
+                    "WIKI_PAGE_WORKFLOW_ENABLED": "0",
+                },
+                clear=False,
+            ):
+                engine = self._new_engine(rag_module, tmpdir)
+                engine._sync_sqlite_search_artifacts = lambda **kwargs: events.append("index")
+                first = engine.prepare_ingest_payload(
+                    str(first_path),
+                    original_filename="sample.pdf",
+                )
+                engine.commit_prepared_ingest(first)
+                second = engine.prepare_ingest_payload(
+                    str(second_path),
+                    original_filename="sample.pdf",
+                )
+                result = engine.commit_prepared_ingest(second)
+
+            conn = engine._connect_db()
+            try:
+                raw_sources = conn.execute(
+                    """
+                    SELECT source_path, COUNT(*) AS chunk_count
+                    FROM chunks
+                    WHERE COALESCE(is_normalized, 0) = 0
+                    GROUP BY source_path
+                    """
+                ).fetchall()
+                file_rows = conn.execute(
+                    "SELECT source_path, orig_name, stored_path FROM files"
+                ).fetchall()
+            finally:
+                conn.close()
+
+            self.assertEqual(first["source_path"], "sample.pdf")
+            self.assertEqual(second["source_path"], "sample.pdf")
+            self.assertEqual([(row[0], row[1]) for row in raw_sources], [("sample.pdf", 1)])
+            self.assertEqual(len(file_rows), 1)
+            self.assertEqual(file_rows[0][0], "sample.pdf")
+            self.assertEqual(file_rows[0][1], "sample.pdf")
+            self.assertEqual(file_rows[0][2], str(second_path))
+            self.assertEqual(result["replaced_chunks"], 1)
+            self.assertEqual(
+                len(list(Path(engine.cache_dir).glob("*.items.pkl"))),
+                1,
+            )
+
+    def test_commit_prepared_ingest_emits_commit_stage_progress_for_cached_reupload(self):
+        events: list[str] = []
+        progress_events: list[tuple[int, str, str, dict[str, object]]] = []
+        rag_module = self._load_rag_module(events)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pdf_path = Path(tmpdir) / "sample.pdf"
+            pdf_path.write_bytes(b"%PDF-1.4\n")
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "RAG_SQLITE_DENSE_ENABLED": "0",
+                    "RAG_HNSW_ENABLED": "0",
+                    "RAG_CONCEPT_LINKS_ENABLED": "0",
+                    "DOCUMENT_UPLOAD_ONTOLOGY_JOB_ENABLED": "0",
+                    "WIKI_PAGE_WORKFLOW_ENABLED": "0",
+                },
+                clear=False,
+            ):
+                engine = self._new_engine(rag_module, tmpdir)
+                engine._sync_sqlite_search_artifacts = lambda **kwargs: events.append("index")
+
+                first = engine.prepare_ingest_payload(str(pdf_path), original_filename="sample.pdf")
+                engine.commit_prepared_ingest(first)
+                progress_events.clear()
+
+                second = engine.prepare_ingest_payload(str(pdf_path), original_filename="sample.pdf")
+                self.assertTrue(second["used_cache"])
+                engine.commit_prepared_ingest(
+                    second,
+                    progress_callback=lambda percent, message, stage, **meta: progress_events.append(
+                        (percent, message, stage, dict(meta))
+                    ),
+                )
+
+        stage_order = [stage for _, _, stage, _ in progress_events]
+        self.assertIn("persist_meta", stage_order)
+        self.assertIn("store_chunks", stage_order)
+        self.assertIn("refresh_index", stage_order)
+        self.assertIn("embed_chunks", stage_order)
+        self.assertIn("sync_derived", stage_order)
+        self.assertTrue(any(meta.get("phase_name_effective") == "refresh_index" for _, _, _, meta in progress_events))
+        self.assertTrue(any(meta.get("phase_name_effective") == "embed_chunks" for _, _, _, meta in progress_events))
+
+    def test_commit_prepared_ingest_exposes_concept_embedding_as_separate_phase(self):
+        events: list[str] = []
+        progress_events: list[tuple[int, str, str, dict[str, object]]] = []
+        rag_module = self._load_rag_module(events)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pdf_path = Path(tmpdir) / "sample.pdf"
+            pdf_path.write_bytes(b"%PDF-1.4\n")
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "RAG_SQLITE_DENSE_ENABLED": "0",
+                    "RAG_HNSW_ENABLED": "0",
+                    "RAG_CONCEPT_LINKS_ENABLED": "1",
+                    "DOCUMENT_UPLOAD_ONTOLOGY_JOB_ENABLED": "0",
+                    "WIKI_PAGE_WORKFLOW_ENABLED": "0",
+                },
+                clear=False,
+            ):
+                engine = self._new_engine(rag_module, tmpdir)
+                engine._sync_sqlite_search_artifacts = lambda **kwargs: events.append("index")
+                engine._sync_concept_links = lambda **kwargs: {"concept_links_added": 0}
+
+                prepared = engine.prepare_ingest_payload(str(pdf_path), original_filename="sample.pdf")
+                engine.commit_prepared_ingest(
+                    prepared,
+                    progress_callback=lambda percent, message, stage, **meta: progress_events.append(
+                        (percent, message, stage, dict(meta))
+                    ),
+                )
+
+        self.assertTrue(
+            any(
+                stage == "sync_derived"
+                and meta.get("phase_name_effective") == "sync_derived_concept_embedding"
+                for _, _, stage, meta in progress_events
+            )
+        )
+
     def test_cached_pdf_prepare_skips_ocr_but_commit_refreshes_index(self):
         events: list[str] = []
         rag_module = self._load_rag_module(events)
@@ -3330,6 +3709,248 @@ class PdfTwoPhaseIngestTests(unittest.TestCase):
         ):
             self.assertIn(key, result)
             self.assertGreaterEqual(float(result[key]), 0.0)
+
+    def test_prepare_ingest_payload_releases_persistent_pdf_worker(self):
+        events: list[str] = []
+
+        def _extract_pdf_pages(path, progress_callback=None, **kwargs):
+            events.append("ocr")
+            return {
+                "parser": "paddleocr_vl",
+                "pages": [{"page_no": 1, "text": "OCR text", "parser": "paddleocr_vl"}],
+                "total_pages": 1,
+                "text_pages": 0,
+                "ocr_pages": 1,
+                "attempted_ocr_pages": 1,
+                "ocr_pages_attempted": 1,
+                "ocr_pages_emitted": 1,
+                "ocr_pages_skipped_empty": 0,
+                "ocr_pages_skipped_short_text": 0,
+                "ocr_attempted_pages_per_minute": 20.0,
+                "ocr_emitted_pages_per_minute": 20.0,
+                "failed_pages": 0,
+            }
+
+        def _shutdown_persistent_ocr_worker(*args, **kwargs):
+            events.append("worker_shutdown")
+            return {
+                "worker_pids": [1234],
+                "alive_after_shutdown": [],
+                "shutdown_confirmed": True,
+            }
+
+        rag_module = _load_module(
+            "codex_test_rag_pdf_worker_release",
+            RAG_PATH,
+            extra_modules={
+                "hnswlib": types.SimpleNamespace(Index=object),
+                "numpy": _stub_numpy_module(),
+                "requests": types.ModuleType("requests"),
+                "sentence_transformers": _stub_sentence_transformers_module(),
+                "src.pdf_ocr": types.SimpleNamespace(
+                    extract_pdf_pages=_extract_pdf_pages,
+                    extract_pdf_pages_with_paddleocr_vl=lambda *args, **kwargs: [],
+                    release_cached_ocr_model=lambda *args, **kwargs: events.append("cache_release"),
+                    shutdown_persistent_ocr_worker=_shutdown_persistent_ocr_worker,
+                ),
+                "src.utils": types.SimpleNamespace(
+                    chunk_txt_items=lambda lines, **kwargs: [
+                        {"text": " ".join(str(line.get("text", "") or "") for line in lines), "line_start": 1, "line_end": 1}
+                    ],
+                    chunk_xlsx_rows=lambda *args, **kwargs: [],
+                    load_txt=lambda *args, **kwargs: [],
+                    load_xlsx=lambda *args, **kwargs: [],
+                ),
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pdf_path = Path(tmpdir) / "sample.pdf"
+            pdf_path.write_bytes(b"%PDF-1.4\n")
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "RAG_SQLITE_DENSE_ENABLED": "0",
+                    "RAG_HNSW_ENABLED": "0",
+                    "RAG_CONCEPT_LINKS_ENABLED": "0",
+                    "DOCUMENT_UPLOAD_ONTOLOGY_JOB_ENABLED": "0",
+                    "WIKI_PAGE_WORKFLOW_ENABLED": "0",
+                },
+                clear=False,
+            ):
+                engine = self._new_engine(rag_module, tmpdir)
+                prepared = engine.prepare_ingest_payload(str(pdf_path), original_filename="sample.pdf")
+
+        self.assertEqual(prepared["status"], "prepared")
+        self.assertIn("cache_release", events)
+        self.assertIn("worker_shutdown", events)
+        self.assertTrue(prepared["pdf_ingest_stats"]["ocr_worker_released"])
+        self.assertGreaterEqual(float(prepared["pdf_ingest_stats"]["ocr_worker_release_seconds"]), 0.0)
+        self.assertEqual(prepared["pdf_ingest_stats"]["ocr_worker_pids"], [1234])
+        self.assertTrue(prepared["pdf_ingest_stats"]["ocr_worker_shutdown_confirmed"])
+
+    def test_upsert_chunk_vectors_for_rows_batches_encode_requests(self):
+        import numpy as real_numpy
+
+        rag_module = _load_module(
+            "codex_test_rag_embed_batch_slices",
+            RAG_PATH,
+            extra_modules={
+                "hnswlib": types.SimpleNamespace(Index=object),
+                "numpy": real_numpy,
+                "requests": types.ModuleType("requests"),
+                "sentence_transformers": _stub_sentence_transformers_module(),
+                "src.pdf_ocr": types.SimpleNamespace(
+                    extract_pdf_pages=lambda *args, **kwargs: {},
+                    extract_pdf_pages_with_paddleocr_vl=lambda *args, **kwargs: [],
+                    release_cached_ocr_model=lambda *args, **kwargs: None,
+                    shutdown_persistent_ocr_worker=lambda *args, **kwargs: None,
+                ),
+                "src.utils": types.SimpleNamespace(
+                    chunk_txt_items=lambda *args, **kwargs: [],
+                    chunk_xlsx_rows=lambda *args, **kwargs: [],
+                    load_txt=lambda *args, **kwargs: [],
+                    load_xlsx=lambda *args, **kwargs: [],
+                ),
+            },
+        )
+
+        class _FakeCursor:
+            def __init__(self):
+                self.executemany_calls: list[int] = []
+
+            def executemany(self, _query, payload):
+                self.executemany_calls.append(len(list(payload)))
+
+        class _FakeConn:
+            def __init__(self):
+                self.cursor_obj = _FakeCursor()
+                self.commit_calls = 0
+
+            def cursor(self):
+                return self.cursor_obj
+
+            def commit(self):
+                self.commit_calls += 1
+
+            def close(self):
+                return None
+
+        encode_calls: list[int] = []
+        progress_calls: list[tuple[int, int, int]] = []
+        fake_conn = _FakeConn()
+        engine = rag_module.RAGEngine.__new__(rag_module.RAGEngine)
+        engine.sqlite_dense_enabled = True
+        engine.embedding_provider = "api"
+        engine.embedding_api_batch_size = 2
+        engine.embed_batch_size = 4
+        engine.embedding_max_batch_tokens = 100
+        engine.embedding_api_url = "http://127.0.0.1:8002"
+        engine.embedding_timeout = 5.0
+        engine.embedding_api_key = ""
+        engine.embedding_api_large_alias = "large"
+        engine._connect_db = lambda: fake_conn
+        engine._encode_texts = lambda index_name, texts, task: encode_calls.append(len(texts)) or [[0.1, 0.2] for _ in texts]
+
+        rows = [
+            {"id": idx + 1, "embedding_text": f"embed {idx + 1}", "text": f"text {idx + 1}"}
+            for idx in range(5)
+        ]
+        rag_module.RAGEngine._upsert_chunk_vectors_for_rows(
+            engine,
+            rows,
+            index_name="large",
+            progress_callback=lambda batch_index, total_batches, rows_done: progress_calls.append(
+                (batch_index, total_batches, rows_done)
+            ),
+            log_context={"source_path": "sample.pdf"},
+        )
+
+        self.assertEqual(encode_calls, [2, 2, 1])
+        self.assertEqual(fake_conn.cursor_obj.executemany_calls, [2, 2, 1])
+        self.assertEqual(progress_calls[0], (1, 3, 0))
+        self.assertEqual(progress_calls[-1], (3, 3, 5))
+        self.assertEqual(len(progress_calls), 6)
+
+
+class PdfSlowBatchDownshiftTests(unittest.TestCase):
+    def test_selected_ocr_batches_repartition_remaining_gpu_tasks_after_slow_batch(self):
+        pdf_module = _load_module(
+            "codex_test_pdf_slow_batch_downshift",
+            PDF_OCR_PATH,
+            extra_modules={},
+        )
+
+        temp_paths: list[str] = []
+        call_page_sets: list[list[list[int]]] = []
+
+        def _fake_build_subset(_pdf_path, page_numbers):
+            handle = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+            handle.close()
+            temp_paths.append(handle.name)
+            return handle.name, {idx + 1: page_no for idx, page_no in enumerate(page_numbers)}
+
+        def _page_payload(task):
+            return [{"page_no": idx + 1, "text": f"OCR {page_no}"} for idx, page_no in enumerate(task["page_numbers"])]
+
+        def _fake_execute(tasks, *, model_name, min_text_chars, device, max_workers, stage, progress_callback=None, progress_percent_fn=None, progress_meta_fn=None, batch_timeout_seconds=None, on_batch_completed=None):
+            task_page_sets = [list(task["page_numbers"]) for task in tasks]
+            call_page_sets.append(task_page_sets)
+            if len(call_page_sets) == 1:
+                runtime_info = {"ocr_pages_attempted": 3, "ocr_pages_emitted": 3}
+                on_batch_completed(tasks[0], _page_payload(tasks[0]), {"ocr_batch_wall_seconds": [120.0]})
+                return {
+                    "completed": [(tasks[0], _page_payload(tasks[0]))],
+                    "remaining_tasks": tasks[1:],
+                    "failure_reason": "",
+                    "runtime_info": runtime_info,
+                }
+            completed = [(task, _page_payload(task)) for task in tasks]
+            for task, pages in completed:
+                on_batch_completed(task, pages, {"ocr_batch_wall_seconds": [10.0]})
+            return {
+                "completed": completed,
+                "remaining_tasks": [],
+                "failure_reason": "",
+                "runtime_info": {"ocr_pages_attempted": len(tasks), "ocr_pages_emitted": len(tasks)},
+            }
+
+        pdf_module._build_pdf_subset_for_pages = _fake_build_subset
+        pdf_module._execute_ocr_subset_tasks = _fake_execute
+        pdf_module._recommended_parallel_ocr_workers = lambda **kwargs: 1
+
+        runtime_info = {}
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".pdf") as tmp_pdf:
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        "PDF_OCR_EXEC_BATCH_PAGES": "3",
+                        "PDF_OCR_SLOW_BATCH_SECONDS": "90",
+                    },
+                    clear=False,
+                ):
+                    pages = pdf_module._extract_pdf_pages_with_paddleocr_vl_selected_pages(
+                        tmp_pdf.name,
+                        page_numbers=[1, 2, 3, 4, 5, 6],
+                        model_name="mock-model",
+                        min_text_chars=4,
+                        device="gpu:0",
+                        total_document_pages=6,
+                        completed_pages_base=0,
+                        runtime_info=runtime_info,
+                    )
+        finally:
+            for temp_path in temp_paths:
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+
+        self.assertEqual(call_page_sets[0], [[1, 2, 3], [4, 5, 6]])
+        self.assertEqual(call_page_sets[1], [[4], [5], [6]])
+        self.assertTrue(runtime_info.get("ocr_slow_batch_downshifted", False))
+        self.assertEqual([page["page_no"] for page in pages], [1, 2, 3, 4, 5, 6])
 
 
 if __name__ == "__main__":

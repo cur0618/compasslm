@@ -284,6 +284,29 @@ class UserFacingCitationTests(unittest.TestCase):
             )
         )
 
+    def test_empty_document_evidence_line_is_removed_before_bottom_citations(self):
+        self.assertTrue(MODULE_PATH.exists())
+        if not MODULE_PATH.exists():
+            return
+
+        module = _load_module()
+        answer = "품앗이는 교환노동입니다. [DOC 1]\n문서 근거:,,,,"
+        docs = {
+            1: {
+                "source_path": "2024농가경제조사사례집.pdf",
+                "source_type": "pdf",
+                "page_no": 134,
+            }
+        }
+
+        rendered = module.render_answer_with_bottom_citations(answer, docs)
+
+        self.assertNotIn("문서 근거:,,,,", rendered)
+        self.assertEqual(
+            rendered,
+            "품앗이는 교환노동입니다.\n\n근거: [[CITATION:1|2024농가경제조사사례집 134페이지]]",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

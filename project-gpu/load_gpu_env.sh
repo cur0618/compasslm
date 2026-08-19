@@ -34,6 +34,10 @@ compass_init_runtime_state() {
   export COMPASS_PORT_LOCK_FILE="${state_root}/ports.lock"
 }
 
+compass_has_flock() {
+  command -v flock >/dev/null 2>&1
+}
+
 compass_port_is_available() {
   local port="$1"
   python3 -c 'import socket,sys
@@ -123,10 +127,14 @@ compass_select_service_port() {
   esac
 
   exec {lock_fd}>"${COMPASS_PORT_LOCK_FILE}"
-  flock "${lock_fd}"
+  if compass_has_flock; then
+    flock "${lock_fd}"
+  fi
   selected="$(compass_select_available_port "${service}" "${start_port}")"
   _compass_reserve_service_port_unlocked "${service}" "${selected}" "$$"
-  flock -u "${lock_fd}"
+  if compass_has_flock; then
+    flock -u "${lock_fd}"
+  fi
   exec {lock_fd}>&-
   echo "[PORT] service=${service} requested=${start_port} selected=${selected} mode=auto" >&2
   echo "${selected}"
@@ -166,9 +174,13 @@ compass_reserve_service_port() {
   local lock_fd
   compass_init_runtime_state
   exec {lock_fd}>"${COMPASS_PORT_LOCK_FILE}"
-  flock "${lock_fd}"
+  if compass_has_flock; then
+    flock "${lock_fd}"
+  fi
   _compass_reserve_service_port_unlocked "${service}" "${port}" "${pid}"
-  flock -u "${lock_fd}"
+  if compass_has_flock; then
+    flock -u "${lock_fd}"
+  fi
   exec {lock_fd}>&-
 }
 
@@ -182,7 +194,9 @@ compass_write_service_state() {
   read -r port_key url_key pid_key <<<"$(compass_service_state_keys "${service}")"
 
   exec {lock_fd}>"${COMPASS_PORT_LOCK_FILE}"
-  flock "${lock_fd}"
+  if compass_has_flock; then
+    flock "${lock_fd}"
+  fi
   tmp_file="${COMPASS_PORT_STATE_FILE}.tmp.$$"
   if [[ -f "${COMPASS_PORT_STATE_FILE}" ]]; then
     grep -Ev "^(${port_key}|${url_key}|${pid_key})=" "${COMPASS_PORT_STATE_FILE}" >"${tmp_file}" || true
@@ -196,7 +210,9 @@ compass_write_service_state() {
   } >>"${tmp_file}"
   chmod 600 "${tmp_file}"
   mv -f "${tmp_file}" "${COMPASS_PORT_STATE_FILE}"
-  flock -u "${lock_fd}"
+  if compass_has_flock; then
+    flock -u "${lock_fd}"
+  fi
   exec {lock_fd}>&-
   echo "[PORT] state_file=${COMPASS_PORT_STATE_FILE}" >&2
 }
@@ -206,6 +222,85 @@ compass_state_value() {
   compass_init_runtime_state
   [[ -f "${COMPASS_PORT_STATE_FILE}" ]] || return 1
   awk -F= -v wanted="${key}" '$1 == wanted {sub(/^[^=]*=/, ""); value=$0} END {if (value != "") print value}' "${COMPASS_PORT_STATE_FILE}"
+}
+
+compass_process_is_alive() {
+  local pid="$1"
+  [[ "${pid}" =~ ^[0-9]+$ ]] && kill -0 "${pid}" 2>/dev/null
+}
+
+compass_wait_for_process_exit() {
+  local pid="$1"
+  local timeout_seconds="${2:-30}"
+  local started now
+  started="$(date +%s)"
+  while compass_process_is_alive "${pid}"; do
+    now="$(date +%s)"
+    if (( now - started >= timeout_seconds )); then
+      return 1
+    fi
+    sleep 1
+  done
+  return 0
+}
+
+compass_shutdown_child() {
+  local service="$1"
+  local pid="$2"
+  local reason="${3:-shutdown}"
+  local graceful_signal="${4:-INT}"
+  local grace_seconds="${COMPASS_SHUTDOWN_GRACE_SECONDS:-30}"
+  local term_seconds="${COMPASS_SHUTDOWN_TERM_SECONDS:-8}"
+
+  if ! [[ "${pid}" =~ ^[0-9]+$ ]]; then
+    return 0
+  fi
+  if ! compass_process_is_alive "${pid}"; then
+    wait "${pid}" 2>/dev/null || true
+    return 0
+  fi
+
+  echo "[SHUTDOWN] service=${service} pid=${pid} reason=${reason} signal=${graceful_signal} status=requested" >&2
+  kill "-${graceful_signal}" "${pid}" 2>/dev/null || true
+  if compass_wait_for_process_exit "${pid}" "${grace_seconds}"; then
+    wait "${pid}" 2>/dev/null || true
+    echo "[SHUTDOWN] service=${service} pid=${pid} status=clean" >&2
+    return 0
+  fi
+
+  echo "[SHUTDOWN][WARN] service=${service} pid=${pid} status=grace_timeout seconds=${grace_seconds} next_signal=TERM" >&2
+  kill -TERM "${pid}" 2>/dev/null || true
+  if compass_wait_for_process_exit "${pid}" "${term_seconds}"; then
+    wait "${pid}" 2>/dev/null || true
+    echo "[SHUTDOWN] service=${service} pid=${pid} status=terminated" >&2
+    return 0
+  fi
+
+  echo "[SHUTDOWN][WARN] service=${service} pid=${pid} status=term_timeout seconds=${term_seconds} next_signal=KILL" >&2
+  kill -KILL "${pid}" 2>/dev/null || true
+  wait "${pid}" 2>/dev/null || true
+}
+
+compass_jupyter_proxy_url() {
+  local port="$1"
+  local base="${COMPASS_JUPYTER_PROXY_BASE:-}"
+  local service_prefix="${JUPYTERHUB_SERVICE_PREFIX:-}"
+  local public_base="${JUPYTER_PUBLIC_BASE_URL:-https://<host>:8000}"
+  local user="${JUPYTERHUB_USER:-<user>}"
+
+  if [[ -z "${port}" ]]; then
+    echo ""
+    return 0
+  fi
+  if [[ -n "${base}" ]]; then
+    echo "${base%/}/${port}/"
+    return 0
+  fi
+  if [[ -n "${service_prefix}" ]]; then
+    echo "${public_base%/}${service_prefix%/}/proxy/${port}/"
+    return 0
+  fi
+  echo "${public_base%/}/user/${user}/proxy/${port}/"
 }
 
 compass_load_live_service_url() {
@@ -270,9 +365,29 @@ except (urllib.error.URLError, TimeoutError, OSError, ValueError, json.JSONDecod
 PY
 }
 
+compass_try_probe_url() {
+  local probe_fn="$1"
+  local url="$2"
+  local __result_var="${3:-}"
+  local probe_error=""
+
+  if [[ -z "${url}" ]]; then
+    [[ -n "${__result_var}" ]] && printf -v "${__result_var}" '%s' "url_empty"
+    return 1
+  fi
+  if ! probe_error="$("${probe_fn}" "${url}" 2>&1)"; then
+    probe_error="${probe_error//$'\r'/}"
+    [[ -n "${__result_var}" ]] && printf -v "${__result_var}" '%s' "${probe_error:-probe_failed}"
+    return 1
+  fi
+  [[ -n "${__result_var}" ]] && printf -v "${__result_var}" '%s' ""
+  return 0
+}
+
 compass_require_live_embedding_url() {
   local auto_port="${COMPASS_AUTO_PORT:-1}"
   local url port pid probe_error
+  local state_url static_url timeout_seconds started now last_reason state_file
   case "${auto_port,,}" in
     0|false|no|off)
       url="${EMBEDDING_API_URL:-}"
@@ -290,22 +405,58 @@ compass_require_live_embedding_url() {
   esac
 
   compass_init_runtime_state
-  port="$(compass_state_value EMBED_PORT_SELECTED || true)"
-  url="$(compass_state_value EMBEDDING_API_URL_SELECTED || true)"
-  pid="$(compass_state_value EMBED_PID || true)"
-  if [[ -z "${port}" || -z "${url}" || -z "${pid}" ]]; then
-    echo "[ERROR] embedding_ready_check=failed reason=state_missing mode=auto state_file=${COMPASS_PORT_STATE_FILE}" >&2
-    return 33
-  fi
-  if [[ ! "${pid}" =~ ^[0-9]+$ ]] || ! kill -0 "${pid}" 2>/dev/null; then
-    echo "[ERROR] embedding_ready_check=failed reason=process_dead mode=auto pid=${pid} url=${url}" >&2
-    return 34
-  fi
-  if ! probe_error="$(compass_probe_embedding_api "${url}" 2>&1)"; then
-    echo "[ERROR] embedding_ready_check=failed reason=${probe_error:-embed_probe_failed} mode=auto pid=${pid} url=${url}" >&2
-    return 35
-  fi
-  echo "${url%/}"
+  state_file="${COMPASS_PORT_STATE_FILE}"
+  static_url="${EMBEDDING_API_URL:-}"
+  timeout_seconds="${EMBEDDING_READY_TIMEOUT_SECONDS:-600}"
+  started="$(date +%s)"
+  progress_seconds="${COMPASS_READY_PROGRESS_SECONDS:-15}"
+  next_progress="$((started + progress_seconds))"
+  last_reason="state_missing"
+
+  while true; do
+    probe_error=""
+    port="$(compass_state_value EMBED_PORT_SELECTED || true)"
+    state_url="$(compass_state_value EMBEDDING_API_URL_SELECTED || true)"
+    pid="$(compass_state_value EMBED_PID || true)"
+    if [[ -n "${port}" && -n "${pid}" && -z "${state_url}" ]]; then
+      if [[ "${pid}" =~ ^[0-9]+$ ]] && ! kill -0 "${pid}" 2>/dev/null; then
+        echo "[ERROR] embedding_ready_check=failed reason=process_dead_before_ready mode=auto state_file=${state_file} port=${port} pid=${pid}" >&2
+        return 36
+      fi
+      last_reason="state_url_missing"
+    fi
+    if [[ -n "${port}" && -n "${state_url}" && -n "${pid}" ]]; then
+      if [[ "${pid}" =~ ^[0-9]+$ ]] && kill -0 "${pid}" 2>/dev/null; then
+        if compass_try_probe_url compass_probe_embedding_api "${state_url}" probe_error; then
+          echo "${state_url%/}"
+          return 0
+        fi
+        last_reason="${probe_error:-embed_probe_failed}"
+      else
+        last_reason="process_dead"
+      fi
+    fi
+
+    if compass_try_probe_url compass_probe_embedding_api "${static_url}" probe_error; then
+      [[ -z "${state_url}" ]] && echo "[WARN] embedding_ready_check=fallback_static_url mode=auto url=${static_url%/}" >&2
+      echo "${static_url%/}"
+      return 0
+    fi
+    if [[ -n "${probe_error}" && "${probe_error}" != "url_empty" ]]; then
+      last_reason="${probe_error}"
+    fi
+
+    now="$(date +%s)"
+    if (( now - started >= timeout_seconds )); then
+      echo "[ERROR] embedding_ready_check=failed reason=${last_reason} mode=auto state_file=${state_file} state_url=${state_url:-} static_url=${static_url:-}" >&2
+      return 35
+    fi
+    if (( progress_seconds > 0 && now >= next_progress )); then
+      echo "[WAIT] embedding_ready_check waiting elapsed_seconds=$((now - started)) reason=${last_reason} state_port=${port:-} state_pid=${pid:-} tip='project-gpu/compass_logs.sh embedding -f'" >&2
+      next_progress="$((now + progress_seconds))"
+    fi
+    sleep 1
+  done
 }
 
 compass_wait_for_embedding_ready() {
@@ -376,6 +527,7 @@ PY
 compass_require_live_llm_url() {
   local auto_port="${COMPASS_AUTO_PORT:-1}"
   local url port pid probe_error
+  local state_url static_url timeout_seconds started now last_reason state_file
   case "${auto_port,,}" in
     0|false|no|off)
       url="${LLM_API_URL:-}"
@@ -393,22 +545,58 @@ compass_require_live_llm_url() {
   esac
 
   compass_init_runtime_state
-  port="$(compass_state_value LLM_PORT_SELECTED || true)"
-  url="$(compass_state_value LLM_API_URL_SELECTED || true)"
-  pid="$(compass_state_value LLM_PID || true)"
-  if [[ -z "${port}" || -z "${url}" || -z "${pid}" ]]; then
-    echo "[ERROR] llm_ready_check=failed reason=state_missing mode=auto state_file=${COMPASS_PORT_STATE_FILE}" >&2
-    return 53
-  fi
-  if [[ ! "${pid}" =~ ^[0-9]+$ ]] || ! kill -0 "${pid}" 2>/dev/null; then
-    echo "[ERROR] llm_ready_check=failed reason=process_dead mode=auto pid=${pid} url=${url}" >&2
-    return 54
-  fi
-  if ! probe_error="$(compass_probe_llm_api "${url}" 2>&1)"; then
-    echo "[ERROR] llm_ready_check=failed reason=${probe_error:-model_list_failed} mode=auto pid=${pid} url=${url}" >&2
-    return 55
-  fi
-  echo "${url}"
+  state_file="${COMPASS_PORT_STATE_FILE}"
+  static_url="${LLM_API_URL:-}"
+  timeout_seconds="${LLM_READY_TIMEOUT_SECONDS:-600}"
+  started="$(date +%s)"
+  progress_seconds="${COMPASS_READY_PROGRESS_SECONDS:-15}"
+  next_progress="$((started + progress_seconds))"
+  last_reason="state_missing"
+
+  while true; do
+    probe_error=""
+    port="$(compass_state_value LLM_PORT_SELECTED || true)"
+    state_url="$(compass_state_value LLM_API_URL_SELECTED || true)"
+    pid="$(compass_state_value LLM_PID || true)"
+    if [[ -n "${port}" && -n "${pid}" && -z "${state_url}" ]]; then
+      if [[ "${pid}" =~ ^[0-9]+$ ]] && ! kill -0 "${pid}" 2>/dev/null; then
+        echo "[ERROR] llm_ready_check=failed reason=process_dead_before_ready mode=auto state_file=${state_file} port=${port} pid=${pid}" >&2
+        return 56
+      fi
+      last_reason="state_url_missing"
+    fi
+    if [[ -n "${port}" && -n "${state_url}" && -n "${pid}" ]]; then
+      if [[ "${pid}" =~ ^[0-9]+$ ]] && kill -0 "${pid}" 2>/dev/null; then
+        if compass_try_probe_url compass_probe_llm_api "${state_url}" probe_error; then
+          echo "${state_url}"
+          return 0
+        fi
+        last_reason="${probe_error:-model_list_failed}"
+      else
+        last_reason="process_dead"
+      fi
+    fi
+
+    if compass_try_probe_url compass_probe_llm_api "${static_url}" probe_error; then
+      [[ -z "${state_url}" ]] && echo "[WARN] llm_ready_check=fallback_static_url mode=auto url=${static_url}" >&2
+      echo "${static_url}"
+      return 0
+    fi
+    if [[ -n "${probe_error}" && "${probe_error}" != "url_empty" ]]; then
+      last_reason="${probe_error}"
+    fi
+
+    now="$(date +%s)"
+    if (( now - started >= timeout_seconds )); then
+      echo "[ERROR] llm_ready_check=failed reason=${last_reason} mode=auto state_file=${state_file} state_url=${state_url:-} static_url=${static_url:-}" >&2
+      return 55
+    fi
+    if (( progress_seconds > 0 && now >= next_progress )); then
+      echo "[WAIT] llm_ready_check waiting elapsed_seconds=$((now - started)) reason=${last_reason} state_port=${port:-} state_pid=${pid:-} tip='project-gpu/compass_logs.sh llm -f'" >&2
+      next_progress="$((now + progress_seconds))"
+    fi
+    sleep 1
+  done
 }
 
 compass_wait_for_llm_ready() {
@@ -463,23 +651,52 @@ PY
 
 compass_require_live_backend_url() {
   local url port pid probe_error
+  local timeout_seconds started now last_reason state_file progress_seconds next_progress
   compass_init_runtime_state
-  port="$(compass_state_value API_PORT_SELECTED || true)"
-  url="$(compass_state_value COMPASSLM_BASE_URL_SELECTED || true)"
-  pid="$(compass_state_value API_PID || true)"
-  if [[ -z "${port}" || -z "${url}" || -z "${pid}" ]]; then
-    echo "[ERROR] backend_ready_check=failed reason=state_missing state_file=${COMPASS_PORT_STATE_FILE}" >&2
-    return 81
-  fi
-  if [[ ! "${pid}" =~ ^[0-9]+$ ]] || ! kill -0 "${pid}" 2>/dev/null; then
-    echo "[ERROR] backend_ready_check=failed reason=process_dead pid=${pid} url=${url}" >&2
-    return 82
-  fi
-  if ! probe_error="$(compass_probe_backend_api "${url}" 2>&1)"; then
-    echo "[ERROR] backend_ready_check=failed reason=${probe_error:-health_failed} pid=${pid} url=${url}" >&2
-    return 83
-  fi
-  echo "${url%/}"
+  state_file="${COMPASS_PORT_STATE_FILE}"
+  timeout_seconds="${BACKEND_STATE_TIMEOUT_SECONDS:-180}"
+  started="$(date +%s)"
+  progress_seconds="${COMPASS_READY_PROGRESS_SECONDS:-15}"
+  next_progress="$((started + progress_seconds))"
+  last_reason="state_missing"
+
+  while true; do
+    probe_error=""
+    port="$(compass_state_value API_PORT_SELECTED || true)"
+    url="$(compass_state_value COMPASSLM_BASE_URL_SELECTED || true)"
+    pid="$(compass_state_value API_PID || true)"
+
+    if [[ -n "${port}" && -n "${pid}" && -z "${url}" ]]; then
+      if [[ "${pid}" =~ ^[0-9]+$ ]] && ! kill -0 "${pid}" 2>/dev/null; then
+        echo "[ERROR] backend_ready_check=failed reason=process_dead_before_ready state_file=${state_file} port=${port} pid=${pid}" >&2
+        return 84
+      fi
+      last_reason="state_url_missing"
+    fi
+
+    if [[ -n "${port}" && -n "${url}" && -n "${pid}" ]]; then
+      if [[ "${pid}" =~ ^[0-9]+$ ]] && kill -0 "${pid}" 2>/dev/null; then
+        if compass_try_probe_url compass_probe_backend_api "${url}" probe_error; then
+          echo "${url%/}"
+          return 0
+        fi
+        last_reason="${probe_error:-health_failed}"
+      else
+        last_reason="process_dead"
+      fi
+    fi
+
+    now="$(date +%s)"
+    if (( now - started >= timeout_seconds )); then
+      echo "[ERROR] backend_ready_check=failed reason=${last_reason} state_file=${state_file} state_url=${url:-} state_port=${port:-} state_pid=${pid:-}" >&2
+      return 85
+    fi
+    if (( progress_seconds > 0 && now >= next_progress )); then
+      echo "[WAIT] backend_ready_check waiting elapsed_seconds=$((now - started)) reason=${last_reason} state_port=${port:-} state_pid=${pid:-} tip='project-gpu/compass_logs.sh backend -f'" >&2
+      next_progress="$((now + progress_seconds))"
+    fi
+    sleep 1
+  done
 }
 
 compass_wait_for_backend_ready() {
@@ -514,6 +731,71 @@ compass_load_env_file() {
     source "${env_file}"
     set +a
   fi
+}
+
+compass_env_file_keys() {
+  local env_file
+  for env_file in "$@"; do
+    [[ -f "${env_file}" ]] || continue
+    sed -nE 's/^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=.*/\2/p' "${env_file}"
+  done | sort -u
+}
+
+compass_load_env_layers() {
+  # Arguments are ordered from the lowest to the highest file priority.
+  # Variables explicitly present in the caller environment always win.
+  local env_file key
+  local -A caller_values=()
+
+  while IFS= read -r key; do
+    [[ -n "${key}" ]] || continue
+    if [[ -v "${key}" ]]; then
+      caller_values["${key}"]="${!key}"
+    fi
+  done < <(compass_env_file_keys "$@")
+
+  for env_file in "$@"; do
+    compass_load_env_file "${env_file}"
+  done
+
+  for key in "${!caller_values[@]}"; do
+    printf -v "${key}" '%s' "${caller_values[${key}]}"
+    export "${key}"
+  done
+}
+
+compass_load_service_env_files() {
+  local service="$1"
+  case "${service}" in
+    backend|llm)
+      compass_load_env_layers \
+        "${MAIN_BACKEND_HOME}/.env" \
+        "${MAIN_BACKEND_HOME}/.env.auto" \
+        "${PROJECT_GPU_HOME}/runtime.env"
+      ;;
+    embedding)
+      compass_load_env_layers \
+        "${EMBEDDING_SERVER_HOME}/.env" \
+        "${EMBEDDING_SERVER_HOME}/.env.auto" \
+        "${PROJECT_GPU_HOME}/runtime.env"
+      ;;
+    *)
+      echo "[ERROR] Unknown service env profile: ${service}" >&2
+      return 2
+      ;;
+  esac
+  echo "[CONFIG] service=${service} env_precedence=service.env<service.env.auto<runtime.env<process" >&2
+}
+
+compass_load_runtime_service_env_files() {
+  # Integrated management commands need auth keys and runtime URLs for probes,
+  # while using the same precedence contract as the individual launchers.
+  compass_load_env_layers \
+    "${EMBEDDING_SERVER_HOME}/.env" \
+    "${MAIN_BACKEND_HOME}/.env" \
+    "${EMBEDDING_SERVER_HOME}/.env.auto" \
+    "${MAIN_BACKEND_HOME}/.env.auto" \
+    "${PROJECT_GPU_HOME}/runtime.env"
 }
 
 compass_detect_embedding_model_path() {
@@ -857,27 +1139,34 @@ compass_detect_llm_runtime() {
   echo "${MAIN_BACKEND_HOME}/runtime/llama-server"
 }
 
-EMBEDDING_MODEL_LARGE_PATH_RAW="${EMBEDDING_MODEL_LARGE_PATH:-$(compass_detect_embedding_model_path)}"
-EMBEDDING_MODEL_LARGE_PATH_RAW="$(compass_prefer_existing_or_rebased_path "${EMBEDDING_MODEL_LARGE_PATH_RAW}")"
-export EMBEDDING_MODEL_LARGE_PATH="$(compass_resolve_embedding_model_path "${EMBEDDING_MODEL_LARGE_PATH_RAW}")"
+if [[ "${COMPASS_SKIP_MODEL_RESOLUTION:-0}" == "1" ]]; then
+  export EMBEDDING_MODEL_LARGE_PATH="${EMBEDDING_MODEL_LARGE_PATH:-}"
+  export LLM_MODELS_DIR="${LLM_MODELS_DIR:-${MAIN_BACKEND_HOME}/models/llm}"
+  export LLM_RUNTIME="${LLM_RUNTIME:-}"
+  export LLM_MODEL_PATH="${LLM_MODEL_PATH:-}"
+else
+  EMBEDDING_MODEL_LARGE_PATH_RAW="${EMBEDDING_MODEL_LARGE_PATH:-$(compass_detect_embedding_model_path)}"
+  EMBEDDING_MODEL_LARGE_PATH_RAW="$(compass_prefer_existing_or_rebased_path "${EMBEDDING_MODEL_LARGE_PATH_RAW}")"
+  export EMBEDDING_MODEL_LARGE_PATH="$(compass_resolve_embedding_model_path "${EMBEDDING_MODEL_LARGE_PATH_RAW}")"
 
-LLM_MODELS_DIR_RAW="${LLM_MODELS_DIR:-${MAIN_BACKEND_HOME}/models/llm}"
-LLM_MODELS_DIR_RAW="$(compass_prefer_existing_or_rebased_path "${LLM_MODELS_DIR_RAW}")"
-export LLM_MODELS_DIR="${LLM_MODELS_DIR_RAW}"
+  LLM_MODELS_DIR_RAW="${LLM_MODELS_DIR:-${MAIN_BACKEND_HOME}/models/llm}"
+  LLM_MODELS_DIR_RAW="$(compass_prefer_existing_or_rebased_path "${LLM_MODELS_DIR_RAW}")"
+  export LLM_MODELS_DIR="${LLM_MODELS_DIR_RAW}"
 
-LLM_RUNTIME_RAW="${LLM_RUNTIME:-$(compass_detect_llm_runtime)}"
-LLM_RUNTIME_RAW="$(compass_prefer_existing_or_rebased_path "${LLM_RUNTIME_RAW}")"
-if [[ ! -e "${LLM_RUNTIME_RAW}" ]]; then
-  LLM_RUNTIME_RAW="$(compass_detect_llm_runtime)"
+  LLM_RUNTIME_RAW="${LLM_RUNTIME:-$(compass_detect_llm_runtime)}"
+  LLM_RUNTIME_RAW="$(compass_prefer_existing_or_rebased_path "${LLM_RUNTIME_RAW}")"
+  if [[ ! -e "${LLM_RUNTIME_RAW}" ]]; then
+    LLM_RUNTIME_RAW="$(compass_detect_llm_runtime)"
+  fi
+  export LLM_RUNTIME="${LLM_RUNTIME_RAW}"
+
+  LLM_MODEL_PATH_RAW="${LLM_MODEL_PATH:-$(compass_detect_llm_model_path)}"
+  LLM_MODEL_PATH_RAW="$(compass_prefer_existing_or_rebased_path "${LLM_MODEL_PATH_RAW}")"
+  if [[ ! -f "${LLM_MODEL_PATH_RAW}" ]]; then
+    LLM_MODEL_PATH_RAW="$(compass_detect_llm_model_path)"
+  fi
+  export LLM_MODEL_PATH="${LLM_MODEL_PATH_RAW}"
 fi
-export LLM_RUNTIME="${LLM_RUNTIME_RAW}"
-
-LLM_MODEL_PATH_RAW="${LLM_MODEL_PATH:-$(compass_detect_llm_model_path)}"
-LLM_MODEL_PATH_RAW="$(compass_prefer_existing_or_rebased_path "${LLM_MODEL_PATH_RAW}")"
-if [[ ! -f "${LLM_MODEL_PATH_RAW}" ]]; then
-  LLM_MODEL_PATH_RAW="$(compass_detect_llm_model_path)"
-fi
-export LLM_MODEL_PATH="${LLM_MODEL_PATH_RAW}"
 
 if [[ "${1:-}" == "--print" ]]; then
   echo "COMPASSLM_HOME=${COMPASSLM_HOME}"

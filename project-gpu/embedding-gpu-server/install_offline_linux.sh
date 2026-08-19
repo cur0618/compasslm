@@ -79,15 +79,15 @@ fi
 REQ_FILE="$(resolve_requirements_file)"
 
 ensure_py311() {
-  local python_cmd="$1"
+  local cmd="$1"
   local label="$2"
-  if ! "${python_cmd}" - <<'PY' >/dev/null 2>&1
+  if ! "${cmd}" - <<'PY' >/dev/null 2>&1
 import sys
 raise SystemExit(0 if (sys.version_info.major, sys.version_info.minor) == (3, 11) else 1)
 PY
   then
     echo "[ERROR] ${label} must be Python 3.11 for cp311-linux_x86_64 package set." >&2
-    echo "Detected interpreter: $("${python_cmd}" --version 2>&1)" >&2
+    echo "Detected interpreter: $("${cmd}" --version 2>&1)" >&2
     exit 1
   fi
 }

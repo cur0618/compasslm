@@ -5,17 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export COMPASSLM_HOME="$(cd "${SCRIPT_DIR}/.." && pwd)"
 source "${SCRIPT_DIR}/load_gpu_env.sh"
 
-PORT_OVERRIDE_SET=0
-AUTO_PORT_OVERRIDE_SET=0
-[[ -n "${LLM_PORT+x}" ]] && PORT_OVERRIDE_SET=1 && LLM_PORT_OVERRIDE="${LLM_PORT}"
-[[ -n "${COMPASS_AUTO_PORT+x}" ]] && AUTO_PORT_OVERRIDE_SET=1 && AUTO_PORT_OVERRIDE="${COMPASS_AUTO_PORT}"
-
-compass_load_env_file "${MAIN_BACKEND_HOME}/.env.auto"
-compass_load_env_file "${PROJECT_GPU_HOME}/runtime.env"
-compass_load_env_file "${MAIN_BACKEND_HOME}/.env"
-
-[[ "${PORT_OVERRIDE_SET}" == "1" ]] && LLM_PORT="${LLM_PORT_OVERRIDE}"
-[[ "${AUTO_PORT_OVERRIDE_SET}" == "1" ]] && COMPASS_AUTO_PORT="${AUTO_PORT_OVERRIDE}"
+compass_load_service_env_files llm
 
 LLM_PORT_START="${LLM_PORT_START:-${LLM_PORT:-8003}}"
 LLM_PORT="$(compass_select_service_port llm "${LLM_PORT_START}" "${LLM_PORT:-${LLM_PORT_START}}")"
@@ -216,11 +206,32 @@ fi
 
 "${LLM_RUNTIME}" "${llama_args[@]}" &
 LLM_SERVER_PID="$!"
-trap 'kill "${LLM_SERVER_PID}" 2>/dev/null || true' INT TERM EXIT
+LLM_SHUTDOWN_REQUESTED=0
+
+compass_llm_shutdown() {
+  local exit_code="${1:-0}"
+  local reason="${2:-script_exit}"
+  local signal_name="${3:-TERM}"
+  if [[ "${LLM_SHUTDOWN_REQUESTED}" == "1" ]]; then
+    exit "${exit_code}"
+  fi
+  LLM_SHUTDOWN_REQUESTED=1
+  trap - INT TERM EXIT
+  compass_shutdown_child llm "${LLM_SERVER_PID:-}" "${reason}" "${signal_name}"
+  exit "${exit_code}"
+}
+
+trap 'compass_llm_shutdown 130 ctrl_c INT' INT
+trap 'compass_llm_shutdown 143 termination TERM' TERM
+trap 'compass_llm_shutdown 0 script_exit TERM' EXIT
 if ! compass_wait_for_llm_ready "${LLM_API_URL_SELECTED}" "${LLM_SERVER_PID}"; then
-  kill "${LLM_SERVER_PID}" 2>/dev/null || true
-  wait "${LLM_SERVER_PID}" 2>/dev/null || true
+  compass_shutdown_child llm "${LLM_SERVER_PID}" startup_failed TERM
   exit 1
 fi
 compass_write_service_state llm "${LLM_PORT}" "${LLM_API_URL_SELECTED}" "${LLM_SERVER_PID}"
+set +e
 wait "${LLM_SERVER_PID}"
+LLM_STATUS="$?"
+set -e
+trap - EXIT
+exit "${LLM_STATUS}"

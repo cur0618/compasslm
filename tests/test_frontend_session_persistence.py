@@ -35,6 +35,29 @@ class FrontendSessionPersistenceTests(unittest.TestCase):
             source,
         )
 
+    def test_script_uses_kb_record_identity_for_chat_buckets(self):
+        source = (ROOT / "src" / "static" / "script.js").read_text(encoding="utf-8")
+        self.assertIn("let kbRecordByName = new Map();", source)
+        self.assertIn("function normalizeKBRecord(raw = {}) {", source)
+        self.assertIn("function replaceKBRecords(kbNames = [], records = []) {", source)
+        self.assertIn("function chatBucketKeyForKB(kbName) {", source)
+        self.assertIn("internal_kb_id", source)
+        self.assertIn("const bucketKey = chatBucketKeyForKB(safeKB);", source)
+        self.assertIn("chatStateCache.chats[bucketKey]", source)
+
+    def test_script_removes_display_and_internal_chat_buckets_on_kb_delete(self):
+        source = (ROOT / "src" / "static" / "script.js").read_text(encoding="utf-8")
+        self.assertIn("function chatBucketKeysForKB(kbName) {", source)
+        self.assertIn("chatBucketKeysForKB(safeKB).forEach(key =>", source)
+        self.assertIn("stopUploadPollingForKB(deletedKB);", source)
+        self.assertIn("kbRecordByName.delete(normalizeKBName(deletedKB));", source)
+
+    def test_script_keeps_internal_chat_bucket_on_kb_rename(self):
+        source = (ROOT / "src" / "static" / "script.js").read_text(encoding="utf-8")
+        self.assertIn("const oldBucketKey = chatBucketKeyForKB(oldKey);", source)
+        self.assertIn("const newBucketKey = chatBucketKeyForKB(newKey);", source)
+        self.assertIn("if (oldBucketKey !== newBucketKey) delete chatStateCache.chats[oldBucketKey];", source)
+
     def test_script_resets_chat_ui_on_logout_and_auth_loss(self):
         source = (ROOT / "src" / "static" / "script.js").read_text(encoding="utf-8")
         self.assertIn("function resetChatStateForLoggedOutUser() {", source)
@@ -137,6 +160,7 @@ class FrontendSessionPersistenceTests(unittest.TestCase):
 
     def test_wiki_panel_exposes_ontology_facts_and_graph_tabs(self):
         script_source = (ROOT / "src" / "static" / "script.js").read_text(encoding="utf-8")
+        style_source = (ROOT / "src" / "static" / "style.css").read_text(encoding="utf-8")
 
         self.assertIn("'Facts'", script_source)
         self.assertIn("'Graph'", script_source)
@@ -148,6 +172,10 @@ class FrontendSessionPersistenceTests(unittest.TestCase):
         self.assertIn("ontology/facts/${encodeURIComponent(factId)}", script_source)
         self.assertIn("evidence_quote", script_source)
         self.assertIn("source_ref", script_source)
+        self.assertIn("item.className = 'wiki-page-item fact-row';", script_source)
+        self.assertIn("body.className = 'wiki-page-body';", script_source)
+        self.assertIn(".wiki-page-item.fact-row", style_source)
+        self.assertIn(".wiki-page-body", style_source)
 
     def test_wiki_facts_tab_manages_ontology_rebuild_jobs(self):
         script_source = (ROOT / "src" / "static" / "script.js").read_text(encoding="utf-8")

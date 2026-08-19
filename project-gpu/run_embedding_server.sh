@@ -5,17 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export COMPASSLM_HOME="$(cd "${SCRIPT_DIR}/.." && pwd)"
 source "${SCRIPT_DIR}/load_gpu_env.sh"
 
-PORT_OVERRIDE_SET=0
-AUTO_PORT_OVERRIDE_SET=0
-[[ -n "${EMBED_PORT+x}" ]] && PORT_OVERRIDE_SET=1 && EMBED_PORT_OVERRIDE="${EMBED_PORT}"
-[[ -n "${COMPASS_AUTO_PORT+x}" ]] && AUTO_PORT_OVERRIDE_SET=1 && AUTO_PORT_OVERRIDE="${COMPASS_AUTO_PORT}"
-
-compass_load_env_file "${EMBEDDING_SERVER_HOME}/.env.auto"
-compass_load_env_file "${PROJECT_GPU_HOME}/runtime.env"
-compass_load_env_file "${EMBEDDING_SERVER_HOME}/.env"
-
-[[ "${PORT_OVERRIDE_SET}" == "1" ]] && EMBED_PORT="${EMBED_PORT_OVERRIDE}"
-[[ "${AUTO_PORT_OVERRIDE_SET}" == "1" ]] && COMPASS_AUTO_PORT="${AUTO_PORT_OVERRIDE}"
+compass_load_service_env_files embedding
 
 EMBED_HOST="${EMBED_HOST:-0.0.0.0}"
 EMBED_PORT_START="${EMBED_PORT_START:-${EMBED_PORT:-8002}}"
@@ -60,6 +50,11 @@ fi
 
 echo "[INFO] EMBEDDING_MODEL_LARGE_PATH=${EMBEDDING_MODEL_LARGE_PATH}"
 echo "[INFO] EMBED_HOST=${EMBED_HOST} EMBED_PORT=${EMBED_PORT}"
+echo "[INFO] EMBED_MODEL_DTYPE=${EMBED_MODEL_DTYPE:-bf16}"
+echo "[INFO] EMBED_MAX_QUERY_TOKENS=${EMBED_MAX_QUERY_TOKENS:-384}"
+echo "[INFO] EMBED_MAX_PASSAGE_TOKENS=${EMBED_MAX_PASSAGE_TOKENS:-768}"
+echo "[INFO] EMBED_MAX_BATCH_TOKENS=${EMBED_MAX_BATCH_TOKENS:-8192}"
+echo "[INFO] EMBED_LENGTH_BUCKETING=${EMBED_LENGTH_BUCKETING:-1}"
 echo "[PORT] EMBEDDING_API_URL=${EMBEDDING_API_URL_SELECTED}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 echo "[INFO] PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF}"
@@ -69,11 +64,32 @@ source "${VENV_PATH}/bin/activate"
 
 python -m uvicorn src.main:app --host "${EMBED_HOST}" --port "${EMBED_PORT}" &
 EMBEDDING_SERVER_PID="$!"
-trap 'kill "${EMBEDDING_SERVER_PID}" 2>/dev/null || true' INT TERM EXIT
+EMBEDDING_SHUTDOWN_REQUESTED=0
+
+compass_embedding_shutdown() {
+  local exit_code="${1:-0}"
+  local reason="${2:-script_exit}"
+  local signal_name="${3:-TERM}"
+  if [[ "${EMBEDDING_SHUTDOWN_REQUESTED}" == "1" ]]; then
+    exit "${exit_code}"
+  fi
+  EMBEDDING_SHUTDOWN_REQUESTED=1
+  trap - INT TERM EXIT
+  compass_shutdown_child embedding "${EMBEDDING_SERVER_PID:-}" "${reason}" "${signal_name}"
+  exit "${exit_code}"
+}
+
+trap 'compass_embedding_shutdown 130 ctrl_c INT' INT
+trap 'compass_embedding_shutdown 143 termination TERM' TERM
+trap 'compass_embedding_shutdown 0 script_exit TERM' EXIT
 if ! compass_wait_for_embedding_ready "${EMBEDDING_API_URL_SELECTED}" "${EMBEDDING_SERVER_PID}"; then
-  kill "${EMBEDDING_SERVER_PID}" 2>/dev/null || true
-  wait "${EMBEDDING_SERVER_PID}" 2>/dev/null || true
+  compass_shutdown_child embedding "${EMBEDDING_SERVER_PID}" startup_failed TERM
   exit 1
 fi
 compass_write_service_state embedding "${EMBED_PORT}" "${EMBEDDING_API_URL_SELECTED}" "${EMBEDDING_SERVER_PID}"
+set +e
 wait "${EMBEDDING_SERVER_PID}"
+EMBEDDING_STATUS="$?"
+set -e
+trap - EXIT
+exit "${EMBEDDING_STATUS}"

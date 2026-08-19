@@ -63,6 +63,31 @@ class AnswerValidationRuleTests(unittest.TestCase):
             )
         )
 
+    def test_seeded_numeric_evidence_with_alignment_skips_tool_recheck(self):
+        module = _load_module()
+        self.assertFalse(
+            module.should_require_tool_recheck(
+                require_tool_evidence=True,
+                allow_retrieval_tool=True,
+                docs_available=24,
+                metrics={"top1": 0.58, "coverage": 0.5},
+                new_tool_event_count=0,
+                numeric_evidence_required=True,
+                evidence_alignment_ok=True,
+            )
+        )
+        self.assertTrue(
+            module.should_require_tool_recheck(
+                require_tool_evidence=True,
+                allow_retrieval_tool=True,
+                docs_available=24,
+                metrics={"top1": 0.58, "coverage": 0.5},
+                new_tool_event_count=0,
+                numeric_evidence_required=True,
+                evidence_alignment_ok=False,
+            )
+        )
+
     def test_missing_seeded_evidence_still_requires_tool_recheck(self):
         module = _load_module()
         self.assertTrue(
@@ -100,9 +125,9 @@ class AnswerValidationRuleTests(unittest.TestCase):
             )
         )
 
-    def test_numeric_query_requires_tool_recheck_even_with_seeded_evidence(self):
+    def test_numeric_query_with_seeded_aligned_evidence_skips_tool_recheck(self):
         module = _load_module()
-        self.assertTrue(
+        self.assertFalse(
             module.should_require_tool_recheck(
                 require_tool_evidence=True,
                 allow_retrieval_tool=True,
@@ -144,7 +169,10 @@ class AnswerValidationRuleTests(unittest.TestCase):
         module = _load_module()
         self.assertTrue(module.is_numeric_evidence_query("봄배추는 언제 지급하는지 알려줘"))
         self.assertTrue(module.is_numeric_evidence_query("경제활동인구조사 지급 주기 알려줘"))
+        self.assertTrue(module.is_numeric_evidence_query("4월 지급 기준 알려줘"))
         self.assertFalse(module.is_numeric_evidence_query("답례품 종류 알려줘"))
+        self.assertFalse(module.is_numeric_evidence_query("품앗이와 일손돕기 차이 알려줘"))
+        self.assertFalse(module.is_numeric_evidence_query("일손돕기 처리 기준 알려줘"))
 
     def test_auto_prefetch_skips_when_numeric_tool_has_already_run(self):
         module = _load_module()
@@ -187,7 +215,7 @@ class AnswerValidationRuleTests(unittest.TestCase):
         self.assertEqual(payload["metrics_coverage"], 1.0)
         self.assertEqual(payload["metrics_unique_sources"], 3)
         self.assertTrue(payload["seeded_retrieval_evidence_ok"])
-        self.assertTrue(payload["should_require_tool_recheck"])
+        self.assertFalse(payload["should_require_tool_recheck"])
         self.assertEqual(payload["top1_threshold"], module.SEEDED_EVIDENCE_TOP1_MIN)
         self.assertEqual(payload["coverage_threshold"], module.SEEDED_EVIDENCE_COVERAGE_MIN)
 
@@ -352,6 +380,27 @@ class AnswerValidationRuleTests(unittest.TestCase):
     def test_plain_text_with_citation_is_allowed(self):
         module = _load_module()
         self.assertFalse(module.contains_disallowed_markdown("단가는 [4만원]입니다. [DOC 1]"))
+
+
+    def test_answer_format_repair_removes_markdown_and_pdf_redirect_phrasing(self):
+        module = _load_module()
+        raw = (
+            "- **\ucc98\ub9ac:** \uc218\uc785\uc73c\ub85c \uc870\uc0ac\ud569\ub2c8\ub2e4. [DOC 1]\n"
+            "1. \ud574\ub2f9 \ud56d\ubaa9\uc5d0 \uba85\uc2dc\ub418\uc5b4 \uc788\uc2b5\ub2c8\ub2e4."
+        )
+        repaired = module.repair_answer_text_format(raw)
+        self.assertFalse(module.contains_disallowed_markdown(repaired))
+        self.assertIn("\ucc98\ub9ac:", repaired)
+        self.assertIn("[DOC 1]", repaired)
+        self.assertNotIn("\ud56d\ubaa9\uc5d0 \uba85\uc2dc", repaired)
+
+    def test_korean_information_queries_do_not_trigger_numeric_validator(self):
+        module = _load_module()
+        self.assertFalse(module.is_numeric_evidence_query("\ub2f5\ub840\ud488 \uc885\ub958 \uc54c\ub824\uc918"))
+        self.assertFalse(module.is_numeric_evidence_query("\uc218\uc785 \ucc98\ub9ac \ubc29\ubc95 \uc124\uba85\ud574\uc918"))
+        self.assertFalse(module.is_numeric_evidence_query("\uc870\uc0ac \uc808\ucc28 \uc694\uc57d\ud574\uc918"))
+        self.assertTrue(module.is_numeric_evidence_query("\uc9c0\uae09\ub2e8\uac00 \uc54c\ub824\uc918"))
+        self.assertTrue(module.is_numeric_evidence_query("\uc5b8\uc81c \uc9c0\uae09\ud574"))
 
 
 if __name__ == "__main__":

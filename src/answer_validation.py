@@ -66,10 +66,66 @@ NON_NUMERIC_INFORMATION_HINTS = (
     "뭐",
     "어떤",
 )
+EXPLICIT_NUMERIC_EVIDENCE_HINTS = (
+    "\uae08\uc561",
+    "\ub2e8\uac00",
+    "\ube44\uc6a9",
+    "\uc5bc\ub9c8",
+    "\uac00\uaca9",
+    "\uc608\uc0b0",
+    "\uc218\uc218\ub8cc",
+    "\uc694\uae08",
+    "\ucc9c\uc6d0",
+    "\ub9cc\uc6d0",
+    "\uc5b5\uc6d0",
+    "%",
+    "\ud37c\uc13c\ud2b8",
+    "\ube44\uc728",
+    "\uac74\uc218",
+    "\uba87\uac74",
+    "\uba87\uba85",
+    "\ucd1d\uc561",
+    "\ud569\uacc4",
+    "\uc218\ub7c9",
+    "\uc5b8\uc81c",
+    "\uc2dc\uae30",
+    "\uc8fc\uae30",
+    "\uc77c\uc815",
+    "\uae30\uc77c",
+    "\uc6d4\ubcc4",
+    "\uae30\uc900\uc77c",
+    "\uc9c0\uae09\uc2dc\uae30",
+    "\uc9c0\uae09\uc8fc\uae30",
+    "\uc9c0\uae09\uae30\uc900\uc77c",
+    "\uc870\uc0ac\uc2dc\uae30",
+    "\uc870\uc0ac\uc8fc\uae30",
+    "\uc5f0\uac04",
+    "\ubc18\uae30",
+    "\ubd84\uae30",
+)
+EXPLICIT_NON_NUMERIC_INFORMATION_HINTS = (
+    "\uc885\ub958",
+    "\uc808\ucc28",
+    "\ubc29\ubc95",
+    "\uac1c\ub150",
+    "\ucc28\uc774",
+    "\uc694\uc57d",
+    "\uc124\uba85",
+    "\ubaa9\ub85d",
+    "\uc8fc\uc758\uc0ac\ud56d",
+    "\ucc98\ub9ac\ubc29\ubc95",
+    "\uc870\uc0ac\ubc29\ubc95",
+)
 STRONG_NUMERIC_OR_TEMPORAL_HINTS = tuple(
     hint
     for hint in NUMERIC_EVIDENCE_HINTS
     if hint not in {"답례품", "월", "일"}
+)
+AMBIGUOUS_NUMERIC_EVIDENCE_HINTS = ("월", "일")
+TEXTUAL_NUMERIC_EVIDENCE_HINTS = tuple(
+    hint
+    for hint in NUMERIC_EVIDENCE_HINTS
+    if hint not in AMBIGUOUS_NUMERIC_EVIDENCE_HINTS
 )
 HIGH_RISK_FALLBACK_HINTS = (
     "법",
@@ -138,6 +194,7 @@ NUMBER_WITH_UNIT_PATTERN = re.compile(
 )
 TEMPORAL_LITERAL_PATTERN = re.compile(r"(?<![\d.])(\d{1,4})\s*(년|월|일|분기)")
 TEMPORAL_KEYWORD_PATTERN = re.compile(r"(상반기|하반기|반기|분기|연간|월간|주간|매월|매년|초순|중순|하순)")
+MONTH_DAY_WITH_NUMBER_PATTERN = re.compile(r"(?<!\d)\d{1,4}\s*(?:월|일)(?![가-힣])")
 
 MONEY_UNIT_FACTORS = {
     "원": Decimal("1"),
@@ -162,11 +219,17 @@ def is_grounded_abstention_text(text: str) -> bool:
 
 def is_numeric_evidence_query(query: str) -> bool:
     compact = _compact_text(query)
-    if any(hint in compact for hint in NON_NUMERIC_INFORMATION_HINTS) and not any(
-        hint in compact for hint in STRONG_NUMERIC_OR_TEMPORAL_HINTS
-    ):
+    has_non_numeric_hint = any(hint in compact for hint in NON_NUMERIC_INFORMATION_HINTS) or any(
+        hint in compact for hint in EXPLICIT_NON_NUMERIC_INFORMATION_HINTS
+    )
+    has_strong_numeric_hint = any(hint in compact for hint in STRONG_NUMERIC_OR_TEMPORAL_HINTS) or any(
+        hint in compact for hint in EXPLICIT_NUMERIC_EVIDENCE_HINTS
+    )
+    if has_non_numeric_hint and not has_strong_numeric_hint:
         return False
-    return any(hint in compact for hint in NUMERIC_EVIDENCE_HINTS)
+    if any(hint in compact for hint in TEXTUAL_NUMERIC_EVIDENCE_HINTS) or has_strong_numeric_hint:
+        return True
+    return bool(MONTH_DAY_WITH_NUMBER_PATTERN.search(query or ""))
 
 
 def is_weak_ocr_hint_text(text: str) -> bool:
@@ -353,7 +416,7 @@ def should_require_tool_recheck(
     if candidate_is_grounded_abstention and not numeric_evidence_required and not seeded_retrieval_evidence:
         return False
     if numeric_evidence_required:
-        return True
+        return not (seeded_retrieval_evidence and evidence_alignment_ok)
     if seeded_retrieval_evidence and not evidence_alignment_ok:
         return True
     return not seeded_retrieval_evidence
@@ -571,3 +634,41 @@ def has_grounded_numeric_answer(
 def contains_disallowed_markdown(text: str) -> bool:
     payload = DOC_LABEL_PATTERN.sub(" ", text or "")
     return any(pattern.search(payload) for pattern in DISALLOWED_MARKDOWN_PATTERNS)
+
+
+STYLE_PHRASE_REPLACEMENTS = (
+    ("\ubb38\uc11c\uc5d0 \uba85\uc2dc\ub418\uc5b4 \uc788\uc2b5\ub2c8\ub2e4", "\ud655\uc778\ub418\ub294 \uae30\uc900\uc785\ub2c8\ub2e4"),
+    ("\ubb38\uc11c\uc5d0 \uba85\uc2dc\ub41c", "\ud655\uc778\ub418\ub294"),
+    ("\ud56d\ubaa9\uc5d0 \uba85\uc2dc\ub418\uc5b4 \uc788\uc2b5\ub2c8\ub2e4", "\ud574\ub2f9 \uae30\uc900\uc785\ub2c8\ub2e4"),
+    ("\ud56d\ubaa9\uc5d0 \uba85\uc2dc\ub41c", "\ud574\ub2f9 \uae30\uc900\uc758"),
+    ("\uc6d0\ubb38\uc744 \ud655\uc778\ud558\uc138\uc694", "\uadfc\uac70\ub294 \uc544\ub798\uc5d0 \ubd99\uc600\uc2b5\ub2c8\ub2e4"),
+    ("\uc6d0\ubb38\uc744 \ud655\uc778\ud574 \uc8fc\uc138\uc694", "\uadfc\uac70\ub294 \uc544\ub798\uc5d0 \ubd99\uc600\uc2b5\ub2c8\ub2e4"),
+    ("PDF\uc5d0\uc11c \ud655\uc778\ud558\uc138\uc694", "\uadfc\uac70\ub294 \uc544\ub798\uc5d0 \ubd99\uc600\uc2b5\ub2c8\ub2e4"),
+    ("\uc790\ub8cc\uc5d0 \ub530\ub974\uba74", "\ud655\uc778\ub41c \ub0b4\uc6a9\uc740"),
+)
+
+
+def repair_answer_text_format(text: str) -> str:
+    payload = (text or "").strip()
+    if not payload:
+        return ""
+
+    repaired_lines: List[str] = []
+    for line in payload.splitlines():
+        current = line.strip()
+        if not current:
+            repaired_lines.append("")
+            continue
+        current = re.sub(r"^\s{0,3}#{1,6}\s+", "", current)
+        current = re.sub(r"^\s{0,3}[-*+]\s+", "", current)
+        current = re.sub(r"^\s{0,3}\d+\.\s+", "", current)
+        current = re.sub(r"\*\*([^\n]+?)\*\*", r"\1", current)
+        current = re.sub(r"__([^\n]+?)__", r"\1", current)
+        current = re.sub(r"`([^`\n]+)`", r"\1", current)
+        repaired_lines.append(current.strip())
+
+    repaired = "\n".join(repaired_lines).strip()
+    for old, new in STYLE_PHRASE_REPLACEMENTS:
+        repaired = repaired.replace(old, new)
+    repaired = re.sub(r"\n{3,}", "\n\n", repaired).strip()
+    return repaired

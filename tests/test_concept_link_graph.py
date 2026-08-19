@@ -2,7 +2,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -15,8 +15,21 @@ sys.modules.setdefault(
     "sentence_transformers",
     SimpleNamespace(SentenceTransformer=object),
 )
+chardet_stub = ModuleType("chardet")
+chardet_stub.detect = lambda _data: {"encoding": "utf-8"}
+sys.modules.setdefault("chardet", chardet_stub)
+
+try:
+    import openpyxl  # noqa: F401
+except ImportError:
+    sys.modules.setdefault("openpyxl", ModuleType("openpyxl"))
 
 from src.rag import RAGEngine
+
+
+CONCEPT_TEXT = "\ud14d\uc2a4\ud2b8"
+GUIDE_TEXT = "\uc9c0\uce68"
+SURVEY_TEXT = "\ub18d\uac00\uacbd\uc81c\uc870\uc0ac"
 
 
 class ConceptLinkGraphTests(unittest.TestCase):
@@ -39,9 +52,9 @@ class ConceptLinkGraphTests(unittest.TestCase):
             rows = []
             for text in texts:
                 normalized = (text or "").strip().lower()
-                if "농사" in normalized or "영농" in normalized:
+                if CONCEPT_TEXT in normalized or "\uc0c1\uc18d" in normalized:
                     rows.append(np.array([1.0, 0.0, 0.0], dtype=np.float32))
-                elif "지원" in normalized:
+                elif GUIDE_TEXT in normalized:
                     rows.append(np.array([0.8, 0.2, 0.0], dtype=np.float32))
                 else:
                     value = float(len(normalized) or 1)
@@ -69,14 +82,22 @@ class ConceptLinkGraphTests(unittest.TestCase):
 
     def test_concept_nodes_are_reused_within_same_kb(self):
         engine = self._build_engine()
-        chunk_a = self._insert_raw_chunk(engine, "a.txt", "농사 지원 기준을 안내합니다.")
-        chunk_b = self._insert_raw_chunk(engine, "b.txt", "다른 파일에서도 농사 절차를 설명합니다.")
+        chunk_a = self._insert_raw_chunk(
+            engine,
+            "a.txt",
+            f"{CONCEPT_TEXT} {GUIDE_TEXT} \uae30\ubc18 \uc548\ub0b4\ubb38\uc785\ub2c8\ub2e4.",
+        )
+        chunk_b = self._insert_raw_chunk(
+            engine,
+            "b.txt",
+            f"\ub2e4\ub978 \ud30c\uc77c\uc5d0\uc11c\ub3c4 {CONCEPT_TEXT} \uc608\uc2dc\ub97c \uc124\uba85\ud569\ub2c8\ub2e4.",
+        )
 
         engine._sync_concept_links(changed_chunk_ids=[chunk_a, chunk_b], deleted_chunk_ids=[])
 
         conn = engine._connect_db()
         cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM concept_nodes WHERE normalized_key = ?", ("농사",))
+        cur.execute("SELECT COUNT(*) FROM concept_nodes WHERE normalized_key = ?", (CONCEPT_TEXT,))
         node_count = int(cur.fetchone()[0])
         cur.execute("SELECT COUNT(*) FROM chunk_concept_edges")
         edge_count = int(cur.fetchone()[0])
@@ -87,11 +108,19 @@ class ConceptLinkGraphTests(unittest.TestCase):
 
     def test_semantic_query_expansion_can_reach_linked_chunks_in_same_kb(self):
         engine = self._build_engine()
-        chunk_a = self._insert_raw_chunk(engine, "a.txt", "영농 지원 대상과 절차를 설명합니다.")
-        chunk_b = self._insert_raw_chunk(engine, "b.txt", "농사 준비 서류를 정리합니다.")
+        chunk_a = self._insert_raw_chunk(
+            engine,
+            "a.txt",
+            "\uc0c1\uc18d \uc9c0\uce68\uc758 \uc808\ucc28\uacfc \uc608\uc2dc\ub97c \uc124\uba85\ud569\ub2c8\ub2e4.",
+        )
+        chunk_b = self._insert_raw_chunk(
+            engine,
+            "b.txt",
+            f"{CONCEPT_TEXT} \uc900\ube44 \uc11c\ub958\ub97c \uc815\ub9ac\ud569\ub2c8\ub2e4.",
+        )
 
         engine._sync_concept_links(changed_chunk_ids=[chunk_a, chunk_b], deleted_chunk_ids=[])
-        concept_candidates = engine._search_concept_candidates("농사", candidate_limit=10)
+        concept_candidates = engine._search_concept_candidates(CONCEPT_TEXT, candidate_limit=10)
 
         self.assertIn(chunk_a, concept_candidates)
         self.assertIn(chunk_b, concept_candidates)
@@ -99,12 +128,52 @@ class ConceptLinkGraphTests(unittest.TestCase):
     def test_concept_links_do_not_cross_kb_boundaries(self):
         engine_a = self._build_engine("test1")
         engine_b = self._build_engine("test2")
-        chunk_a = self._insert_raw_chunk(engine_a, "a.txt", "농사 지원 기준입니다.")
+        chunk_a = self._insert_raw_chunk(
+            engine_a,
+            "a.txt",
+            f"{CONCEPT_TEXT} {GUIDE_TEXT} \uae30\ubc18 \ubb38\uc11c\uc785\ub2c8\ub2e4.",
+        )
 
         engine_a._sync_concept_links(changed_chunk_ids=[chunk_a], deleted_chunk_ids=[])
-        concept_candidates = engine_b._search_concept_candidates("농사", candidate_limit=10)
+        concept_candidates = engine_b._search_concept_candidates(CONCEPT_TEXT, candidate_limit=10)
 
         self.assertEqual(concept_candidates, {})
+
+    def test_concept_links_accept_korean_ocr_text_without_regex_error(self):
+        engine = self._build_engine()
+        chunk_id = self._insert_raw_chunk(
+            engine,
+            "ocr.txt",
+            "2026\ub144 \ub18d\uac00\uacbd\uc81c\uc870\uc0ac \uc9c0\uce68\uc11c\ub97c \ubcf4\uace0 "
+            "\uc870\uc0ac\ud45c \uc791\uc131 \uc808\ucc28\uc640 \uc81c\ucd9c \uc21c\uc11c\ub97c "
+            "\uc815\ub9ac\ud569\ub2c8\ub2e4.",
+        )
+
+        engine._sync_concept_links(changed_chunk_ids=[chunk_id], deleted_chunk_ids=[])
+
+        conn = engine._connect_db()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT COUNT(*) FROM concept_nodes WHERE normalized_key = ?",
+            (SURVEY_TEXT,),
+        )
+        node_count = int(cur.fetchone()[0])
+        cur.execute("SELECT COUNT(*) FROM chunk_concept_edges WHERE chunk_pk = ?", (chunk_id,))
+        edge_count = int(cur.fetchone()[0])
+        conn.close()
+
+        self.assertGreaterEqual(node_count, 1)
+        self.assertGreater(edge_count, 0)
+
+    def test_query_literal_helpers_accept_unicode_quotes_and_mixed_ids(self):
+        engine = self._build_engine()
+
+        literals = engine._extract_query_literals(
+            '\u201c\ub18d\uac00\uacbd\uc81c\uc870\uc0ac \uc9c0\uce68\uc11c\u201d API-2026/07 \uc5c5\ub85c\ub4dc'
+        )
+
+        self.assertIn("\ub18d\uac00\uacbd\uc81c\uc870\uc0ac \uc9c0\uce68\uc11c", literals)
+        self.assertIn("api-2026/07", literals)
 
 
 if __name__ == "__main__":

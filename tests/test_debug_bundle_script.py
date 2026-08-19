@@ -151,6 +151,85 @@ def _create_kb_meta_db(
     )
     conn.execute(
         """
+        CREATE TABLE wiki_saved_answers
+        (
+            saved_answer_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            query_id TEXT,
+            answer_log_id INTEGER,
+            user_id TEXT,
+            question_text TEXT,
+            answer_text TEXT,
+            answer_summary TEXT,
+            citation_json TEXT,
+            status TEXT,
+            quality_flags_json TEXT,
+            created_at INTEGER,
+            updated_at INTEGER
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE wiki_answer_feedback
+        (
+            feedback_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            saved_answer_id INTEGER,
+            answer_log_id INTEGER,
+            query_id TEXT,
+            user_id TEXT,
+            feedback_type TEXT,
+            saved_to_wiki INTEGER,
+            created_at INTEGER
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE ontology_entities
+        (
+            entity_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kb_id TEXT,
+            display_text TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE ontology_facts
+        (
+            fact_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kb_id TEXT,
+            subject_entity_id INTEGER,
+            predicate TEXT,
+            object_entity_id INTEGER,
+            object_value TEXT,
+            fact_kind TEXT,
+            extraction_method TEXT,
+            confidence REAL,
+            status TEXT,
+            created_at INTEGER,
+            updated_at INTEGER
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE ontology_fact_sources
+        (
+            source_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fact_id INTEGER,
+            chunk_id INTEGER,
+            source_path TEXT,
+            source_ref TEXT,
+            page_no INTEGER,
+            line_start INTEGER,
+            line_end INTEGER,
+            evidence_quote TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
         INSERT INTO retrieval_logs (query_id, user_id, query_text, topk_ids_json, meta_json, created_at)
         VALUES (?, ?, ?, ?, ?, ?)
         """,
@@ -177,6 +256,57 @@ def _create_kb_meta_db(
             json.dumps({"grounded": True}, ensure_ascii=False),
             created_at + 2,
         ),
+    )
+    conn.execute(
+        """
+        INSERT INTO wiki_saved_answers
+            (saved_answer_id, query_id, answer_log_id, user_id, question_text, answer_text,
+             answer_summary, citation_json, status, quality_flags_json, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            1,
+            query_id,
+            1,
+            session_id,
+            query_text,
+            answer_text,
+            "신고된 답변 요약",
+            json.dumps([{"chunk_id": 101, "label": "[1]"}], ensure_ascii=False),
+            "reported",
+            json.dumps(["reported"], ensure_ascii=False),
+            created_at + 3,
+            created_at + 3,
+        ),
+    )
+    conn.execute(
+        """
+        INSERT INTO wiki_answer_feedback
+            (saved_answer_id, answer_log_id, query_id, user_id, feedback_type, saved_to_wiki, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (1, 1, query_id, session_id, "report_citation_issue", 0, created_at + 4),
+    )
+    conn.execute(
+        "INSERT INTO ontology_entities (entity_id, kb_id, display_text) VALUES (?, ?, ?)",
+        (1, "default", "농가경제조사"),
+    )
+    conn.execute(
+        """
+        INSERT INTO ontology_facts
+            (fact_id, kb_id, subject_entity_id, predicate, object_entity_id, object_value,
+             fact_kind, extraction_method, confidence, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (7, "default", 1, "지급단가", 0, "40천원", "literal", "limited_llm", 0.44, "reported", created_at + 5, created_at + 6),
+    )
+    conn.execute(
+        """
+        INSERT INTO ontology_fact_sources
+            (fact_id, chunk_id, source_path, source_ref, page_no, line_start, line_end, evidence_quote)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (7, 101, "/uploads/guide.pdf", "guide.pdf 4페이지", 4, 10, 12, "농가경제조사 지급단가 40천원"),
     )
     conn.commit()
     conn.close()
@@ -276,11 +406,21 @@ class DebugBundleScriptTests(unittest.TestCase):
             self.assertIn("recent_agent_runs", bundle)
             self.assertIn("recent_retrieval_logs", bundle)
             self.assertIn("recent_answer_logs", bundle)
+            self.assertIn("recent_no_evidence_reports", bundle)
+            self.assertIn("recent_reported_ontology_facts", bundle)
             self.assertIn("log_tails", bundle)
             self.assertGreaterEqual(len(bundle["recent_chat_messages"]), 1)
             self.assertGreaterEqual(len(bundle["recent_agent_runs"]), 1)
             self.assertGreaterEqual(len(bundle["recent_retrieval_logs"]), 1)
             self.assertGreaterEqual(len(bundle["recent_answer_logs"]), 1)
+            self.assertGreaterEqual(len(bundle["recent_no_evidence_reports"]), 1)
+            self.assertGreaterEqual(len(bundle["recent_reported_ontology_facts"]), 1)
+            self.assertEqual(bundle["summary"]["recent_no_evidence_report_count"], 1)
+            self.assertEqual(bundle["summary"]["recent_reported_ontology_fact_count"], 1)
+            self.assertIn("validator_diagnostics", bundle["summary"])
+            self.assertIn("validator_diagnostics", bundle["recent_kb_snapshots"][0])
+            self.assertIn("report_citation_issue", json.dumps(bundle["recent_no_evidence_reports"], ensure_ascii=False))
+            self.assertIn("농가경제조사", json.dumps(bundle["recent_reported_ontology_facts"], ensure_ascii=False))
             self.assertIn("document_grounded", json.dumps(bundle["recent_agent_runs"], ensure_ascii=False))
             self.assertIn("문서 핵심 요약", result.stdout)
 
@@ -493,6 +633,17 @@ class DebugBundleScriptTests(unittest.TestCase):
             kb_names = [item["kb_name"] for item in bundle["recent_kb_snapshots"]]
             self.assertIn("nong1", kb_names)
             self.assertIn("답례품", kb_names)
+
+    def test_collect_debug_bundle_documents_cookie_auth_for_protected_api(self):
+        script = SCRIPT_PATH.read_text(encoding="utf-8")
+
+        self.assertIn("COMPASSLM_DEBUG_AUTH_COOKIE='cookie-value'", script)
+        self.assertIn("COMPASSLM_DEBUG_COOKIE_HEADER='compass_auth_session=cookie-value; other=value'", script)
+        self.assertIn("COMPASSLM_DEBUG_PYTHON_BIN", script)
+        self.assertIn("DEBUG_PYTHON_BIN=\"python\"", script)
+        self.assertIn("ops_failure_patterns_ok=false", script)
+        self.assertIn("api_auth_missing=true", script)
+        self.assertIn("/ops/* plus /kbs/* API diagnostics will be omitted", script)
 
 
 if __name__ == "__main__":

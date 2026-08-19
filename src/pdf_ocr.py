@@ -52,6 +52,9 @@ _OCR_LOCK = threading.Lock()
 _OCR_MODEL = None
 _OCR_MODEL_NAME = ""
 _OCR_MODEL_DEVICE = ""
+_FAST_OCR_MODEL = None
+_FAST_OCR_MODEL_KEY = ""
+_FAST_OCR_MODEL_DEVICE = ""
 _LAST_OCR_RUNTIME_INFO: Dict[str, Any] = {}
 _LAST_OCR_SERIAL_TIMING_INFO: Dict[str, Any] = {}
 _PERSISTENT_OCR_LOCK = threading.Lock()
@@ -59,6 +62,7 @@ _PERSISTENT_OCR_EXECUTOR: Optional[concurrent.futures.ProcessPoolExecutor] = Non
 _PERSISTENT_OCR_WORKERS = 0
 _PERSISTENT_OCR_DEVICE = ""
 _PERSISTENT_OCR_MODEL_NAME = ""
+_PERSISTENT_OCR_BACKEND = ""
 _PERSISTENT_OCR_READY_INFO: Dict[str, Any] = {}
 _PERSISTENT_OCR_WARMUP_ERROR = ""
 _OCR_DEFAULT_MODEL_NAME = "PaddleOCR-VL-1.5"
@@ -254,10 +258,14 @@ def _ocr_failure_needs_cpu_fallback(error: BaseException, *, device: Optional[st
 
 def _reset_cached_ocr_model() -> None:
     global _OCR_MODEL, _OCR_MODEL_NAME, _OCR_MODEL_DEVICE
+    global _FAST_OCR_MODEL, _FAST_OCR_MODEL_KEY, _FAST_OCR_MODEL_DEVICE
     with _OCR_LOCK:
         _OCR_MODEL = None
         _OCR_MODEL_NAME = ""
         _OCR_MODEL_DEVICE = ""
+        _FAST_OCR_MODEL = None
+        _FAST_OCR_MODEL_KEY = ""
+        _FAST_OCR_MODEL_DEVICE = ""
     gc.collect()
 
 
@@ -278,7 +286,13 @@ def _clear_paddle_gpu_cache() -> bool:
 
 
 def release_cached_ocr_model(*, device: Optional[str] = None, force: bool = False) -> bool:
-    resolved_device = (device or _OCR_MODEL_DEVICE or os.getenv("PDF_OCR_DEVICE", "") or "").strip()
+    resolved_device = (
+        device
+        or _OCR_MODEL_DEVICE
+        or _FAST_OCR_MODEL_DEVICE
+        or os.getenv("PDF_OCR_DEVICE", "")
+        or os.getenv("PDF_OCR_FAST_DEVICE", "")
+    ).strip()
     should_release = force or (
         _is_gpu_device(resolved_device)
         and _env_enabled("PDF_OCR_RELEASE_GPU_MODEL_AFTER_RUN", True)
@@ -317,12 +331,24 @@ def _merge_ocr_timing_info(target: Dict[str, Any], source: Optional[Dict[str, An
         "ocr_predict_seconds",
         "ocr_output_materialize_seconds",
         "ocr_payload_convert_seconds",
+        "ocr_fragment_collect_seconds",
+        "ocr_page_dedupe_seconds",
+        "ocr_page_join_seconds",
         "ocr_text_merge_seconds",
         "ocr_merge_seconds",
     ):
         if key not in source:
             continue
         target[key] = round(float(target.get(key, 0.0) or 0.0) + float(source.get(key, 0.0) or 0.0), 3)
+    for key in (
+        "ocr_pages_attempted",
+        "ocr_pages_emitted",
+        "ocr_pages_skipped_empty",
+        "ocr_pages_skipped_short_text",
+    ):
+        if key not in source:
+            continue
+        target[key] = int(target.get(key, 0) or 0) + int(source.get(key, 0) or 0)
     if "ocr_batch_count" in source:
         target["ocr_batch_count"] = int(target.get("ocr_batch_count", 0) or 0) + int(source.get("ocr_batch_count", 0) or 0)
     batch_wall_seconds = source.get("ocr_batch_wall_seconds")
@@ -513,9 +539,17 @@ def _resolve_ocr_batch_timeout_seconds(
     return max(configured_seconds, dynamic_floor)
 
 
-def _terminate_process_pool(executor: concurrent.futures.ProcessPoolExecutor) -> None:
+def _terminate_process_pool(executor: concurrent.futures.ProcessPoolExecutor) -> Dict[str, Any]:
+    worker_pids: List[int] = []
+    alive_after: List[int] = []
     processes = getattr(executor, "_processes", None)
     if isinstance(processes, dict):
+        for process in list(processes.values()):
+            try:
+                if process is not None and int(getattr(process, "pid", 0) or 0) > 0:
+                    worker_pids.append(int(process.pid))
+            except Exception:
+                pass
         for process in list(processes.values()):
             try:
                 if process is not None and process.is_alive():
@@ -526,12 +560,19 @@ def _terminate_process_pool(executor: concurrent.futures.ProcessPoolExecutor) ->
             try:
                 if process is not None:
                     process.join(timeout=1.0)
+                    if process.is_alive() and int(getattr(process, "pid", 0) or 0) > 0:
+                        alive_after.append(int(process.pid))
             except Exception:
                 pass
     try:
         executor.shutdown(wait=False, cancel_futures=True)
     except Exception:
         pass
+    return {
+        "worker_pids": sorted(set(worker_pids)),
+        "alive_after_shutdown": sorted(set(alive_after)),
+        "shutdown_confirmed": not bool(alive_after),
+    }
 
 
 def _persistent_ocr_worker_enabled(device: str) -> bool:
@@ -554,18 +595,41 @@ def _clear_persistent_ocr_ready_info(*, clear_error: bool = False) -> None:
         _PERSISTENT_OCR_WARMUP_ERROR = ""
 
 
-def shutdown_persistent_ocr_worker(*, clear_error: bool = True) -> None:
-    global _PERSISTENT_OCR_EXECUTOR, _PERSISTENT_OCR_WORKERS, _PERSISTENT_OCR_DEVICE, _PERSISTENT_OCR_MODEL_NAME
+def shutdown_persistent_ocr_worker(*, clear_error: bool = True) -> Dict[str, Any]:
+    global _PERSISTENT_OCR_EXECUTOR, _PERSISTENT_OCR_WORKERS, _PERSISTENT_OCR_DEVICE
+    global _PERSISTENT_OCR_MODEL_NAME, _PERSISTENT_OCR_BACKEND
     executor = None
+    worker_pids: List[int] = []
     with _PERSISTENT_OCR_LOCK:
         executor = _PERSISTENT_OCR_EXECUTOR
+        processes = getattr(executor, "_processes", None) if executor is not None else None
+        if isinstance(processes, dict):
+            for process in list(processes.values()):
+                try:
+                    if process is not None and int(getattr(process, "pid", 0) or 0) > 0:
+                        worker_pids.append(int(process.pid))
+                except Exception:
+                    pass
         _PERSISTENT_OCR_EXECUTOR = None
         _PERSISTENT_OCR_WORKERS = 0
         _PERSISTENT_OCR_DEVICE = ""
         _PERSISTENT_OCR_MODEL_NAME = ""
+        _PERSISTENT_OCR_BACKEND = ""
         _clear_persistent_ocr_ready_info(clear_error=clear_error)
     if executor is not None:
-        _terminate_process_pool(executor)
+        result = _terminate_process_pool(executor) or {}
+    else:
+        result = {
+            "worker_pids": sorted(set(worker_pids)),
+            "alive_after_shutdown": [],
+            "shutdown_confirmed": True,
+        }
+    result.setdefault("worker_pids", [])
+    result.setdefault("alive_after_shutdown", [])
+    result.setdefault("shutdown_confirmed", True)
+    if not result.get("worker_pids") and worker_pids:
+        result["worker_pids"] = sorted(set(worker_pids))
+    return result
 
 
 def _ensure_persistent_ocr_worker(
@@ -573,11 +637,14 @@ def _ensure_persistent_ocr_worker(
     model_name: str,
     device: str,
     requested_workers: int = 1,
+    backend: str = "vl_only",
 ) -> concurrent.futures.ProcessPoolExecutor:
-    global _PERSISTENT_OCR_EXECUTOR, _PERSISTENT_OCR_WORKERS, _PERSISTENT_OCR_DEVICE, _PERSISTENT_OCR_MODEL_NAME
+    global _PERSISTENT_OCR_EXECUTOR, _PERSISTENT_OCR_WORKERS, _PERSISTENT_OCR_DEVICE
+    global _PERSISTENT_OCR_MODEL_NAME, _PERSISTENT_OCR_BACKEND
     resolved_workers = _persistent_ocr_worker_count(requested_workers)
     resolved_device = (device or os.getenv("PDF_OCR_DEVICE", "cpu") or "cpu").strip()
     resolved_model_name = (model_name or os.getenv("PDF_OCR_MODEL_NAME", _OCR_DEFAULT_MODEL_NAME) or _OCR_DEFAULT_MODEL_NAME).strip()
+    resolved_backend = _normalize_ocr_backend(backend)
     stale_executor = None
     with _PERSISTENT_OCR_LOCK:
         if (
@@ -585,6 +652,7 @@ def _ensure_persistent_ocr_worker(
             and _PERSISTENT_OCR_WORKERS == resolved_workers
             and _PERSISTENT_OCR_DEVICE == resolved_device
             and _PERSISTENT_OCR_MODEL_NAME == resolved_model_name
+            and _PERSISTENT_OCR_BACKEND == resolved_backend
         ):
             return _PERSISTENT_OCR_EXECUTOR
         stale_executor = _PERSISTENT_OCR_EXECUTOR
@@ -595,6 +663,7 @@ def _ensure_persistent_ocr_worker(
         _PERSISTENT_OCR_WORKERS = resolved_workers
         _PERSISTENT_OCR_DEVICE = resolved_device
         _PERSISTENT_OCR_MODEL_NAME = resolved_model_name
+        _PERSISTENT_OCR_BACKEND = resolved_backend
         _clear_persistent_ocr_ready_info()
         executor = _PERSISTENT_OCR_EXECUTOR
     if stale_executor is not None:
@@ -608,12 +677,19 @@ def _ensure_persistent_ocr_worker(
 def _persistent_ocr_warmup_worker(task: Dict[str, Any]) -> Dict[str, Any]:
     device = str(task.get("device", "cpu") or "cpu").strip()
     model_name = str(task.get("model_name", "") or _OCR_DEFAULT_MODEL_NAME).strip()
+    backend = _normalize_ocr_backend(str(task.get("backend", "vl_only") or "vl_only"))
     if device:
         os.environ["PDF_OCR_DEVICE"] = device
     started_at = time.monotonic()
-    _load_ocr_model(model_name=model_name, device=device)
+    if backend == "ppocr_fast_v1":
+        _load_fast_ocr_model(device=device)
+    elif backend == "vl_only":
+        _load_ocr_model(model_name=model_name, device=device)
+    else:
+        raise ValueError(f"Unsupported local OCR warmup backend: {backend}")
     return {
         "status": "ready",
+        "backend": backend,
         "device": device,
         "model_name": model_name,
         "model_load_seconds": round(time.monotonic() - started_at, 3),
@@ -628,14 +704,43 @@ def warmup_persistent_ocr_worker(
     timeout_seconds: Optional[float] = None,
 ) -> Dict[str, Any]:
     global _PERSISTENT_OCR_READY_INFO, _PERSISTENT_OCR_WARMUP_ERROR
-    resolved_device = (device or os.getenv("PDF_OCR_DEVICE", "cpu") or "cpu").strip()
+    resolved_backend = _normalize_ocr_backend(os.getenv("PDF_OCR_BACKEND", "ppocr_fast_v1"))
+    default_device = (
+        os.getenv("PDF_OCR_FAST_DEVICE", os.getenv("PDF_OCR_DEVICE", "cpu"))
+        if resolved_backend == "ppocr_fast_v1"
+        else os.getenv("PDF_OCR_DEVICE", "cpu")
+    )
+    resolved_device = (device or default_device or "cpu").strip()
     resolved_model_name = (model_name or os.getenv("PDF_OCR_MODEL_NAME", _OCR_DEFAULT_MODEL_NAME) or _OCR_DEFAULT_MODEL_NAME).strip()
-    if (os.getenv("PDF_OCR_BACKEND", "local") or "local").strip().lower() == "hps":
+    if resolved_backend == "hps":
         return {
             "status": "skipped",
+            "backend": resolved_backend,
             "device": resolved_device,
             "model_name": resolved_model_name,
             "reason": "hps_backend_selected",
+        }
+    if resolved_backend == "ppocr_fast_v1":
+        started_at = time.monotonic()
+        _load_fast_ocr_model(device=resolved_device)
+        return {
+            "status": "ready",
+            "backend": resolved_backend,
+            "device": resolved_device,
+            "model_name": f"PaddleOCR:{os.getenv('PDF_OCR_FAST_LANG', 'korean')}",
+            "model_load_seconds": round(time.monotonic() - started_at, 3),
+            "execution_scope": "backend_process",
+            "worker_count": 0,
+            "worker_pids": [],
+            "worker_pid": os.getpid(),
+        }
+    if resolved_backend != "vl_only":
+        return {
+            "status": "skipped",
+            "backend": resolved_backend,
+            "device": resolved_device,
+            "model_name": resolved_model_name,
+            "reason": "unsupported_backend",
         }
     requested_workers = max(1, int(os.getenv("PDF_OCR_PERSISTENT_WORKERS", "1") or "1"))
     resolved_workers = _persistent_ocr_worker_count(requested_workers)
@@ -650,6 +755,7 @@ def warmup_persistent_ocr_worker(
         cached = dict(_PERSISTENT_OCR_READY_INFO)
     if (
         cached.get("status") == "ready"
+        and cached.get("backend") == resolved_backend
         and cached.get("device") == resolved_device
         and cached.get("model_name") == resolved_model_name
         and int(cached.get("worker_count", 0) or 0) == resolved_workers
@@ -659,6 +765,7 @@ def warmup_persistent_ocr_worker(
         model_name=resolved_model_name,
         device=resolved_device,
         requested_workers=resolved_workers,
+        backend=resolved_backend,
     )
     timeout = timeout_seconds
     if timeout is None:
@@ -669,6 +776,7 @@ def warmup_persistent_ocr_worker(
             {
                 "model_name": resolved_model_name,
                 "device": resolved_device,
+                "backend": resolved_backend,
             },
         )
         for _ in range(resolved_workers)
@@ -824,6 +932,7 @@ def _execute_ocr_subset_tasks(
             model_name=model_name,
             device=device,
             requested_workers=resolved_workers,
+            backend="vl_only",
         )
     else:
         executor = concurrent.futures.ProcessPoolExecutor(
@@ -1168,6 +1277,10 @@ def _resolve_ocr_exec_batch_pages() -> int:
     return max(1, int(raw or "4"))
 
 
+def _resolve_ocr_slow_batch_seconds() -> float:
+    return max(0.0, _to_float(os.getenv("PDF_OCR_SLOW_BATCH_SECONDS", "90"), 90.0))
+
+
 def _resolve_ocr_progress_heartbeat_interval_seconds() -> float:
     return max(
         0.5,
@@ -1231,6 +1344,10 @@ def _extract_pdf_pages_with_paddleocr_vl_selected_pages(
     runtime_state.setdefault("ocr_gpu_failure_reason", "")
     runtime_state.setdefault("ocr_retry_mode", _ocr_retry_mode_for(device, worker_count))
     runtime_state.setdefault("ocr_retry_reason", "")
+    runtime_state.setdefault("ocr_pages_attempted", ocr_target_pages)
+    runtime_state.setdefault("ocr_pages_emitted", 0)
+    runtime_state.setdefault("ocr_pages_skipped_empty", 0)
+    runtime_state.setdefault("ocr_pages_skipped_short_text", 0)
 
     def _progress_meta() -> Dict[str, Any]:
         current_page = max(0, min(safe_total_document_pages, safe_completed_base + completed_ocr_pages))
@@ -1349,6 +1466,31 @@ def _extract_pdf_pages_with_paddleocr_vl_selected_pages(
     try:
         subset_build_started_at = time.monotonic()
         tasks: List[Dict[str, Any]] = []
+        total_batches = len(page_batches)
+        slow_batch_seconds = _resolve_ocr_slow_batch_seconds()
+        slow_batch_downshifted = False
+
+        def _replan_remaining_tasks_to_single_pages(remaining: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            nonlocal total_batches
+            replanned: List[Dict[str, Any]] = []
+            next_batch_index = total_batches + 1
+            for task in list(remaining or []):
+                for page_no in list(task.get("page_numbers", []) or []):
+                    subset_pdf_path, subset_page_map = _build_pdf_subset_for_pages(pdf_path, [page_no])
+                    temp_paths.append(subset_pdf_path)
+                    replanned.append(
+                        {
+                            "batch_index": next_batch_index,
+                            "page_numbers": [int(page_no)],
+                            "pdf_path": subset_pdf_path,
+                            "subset_page_map": subset_page_map,
+                            "original_pages_label": str(page_no),
+                        }
+                    )
+                    next_batch_index += 1
+            total_batches = next_batch_index - 1
+            return replanned
+
         for batch_index, batch in enumerate(page_batches, start=1):
             subset_pdf_path, subset_page_map = _build_pdf_subset_for_pages(pdf_path, batch)
             temp_paths.append(subset_pdf_path)
@@ -1373,6 +1515,7 @@ def _extract_pdf_pages_with_paddleocr_vl_selected_pages(
         runtime_state["ocr_retry_mode"] = current_mode
 
         while remaining_tasks:
+            slow_batch_repartition_requested = False
             current_stage = "fallback_pdf_ocr" if current_mode == "cpu" else "run_pdf_ocr"
             current_message = (
                 "GPU OCR이 계속 실패해 CPU로 다시 시도하는 중입니다."
@@ -1392,14 +1535,41 @@ def _extract_pdf_pages_with_paddleocr_vl_selected_pages(
                 subset_results: List[Dict[str, Any]],
                 _batch_runtime_info: Dict[str, Any],
             ) -> None:
+                nonlocal slow_batch_repartition_requested, slow_batch_downshifted
                 _apply_completed_batches(
                     [(task, subset_results)],
                     mode=current_mode,
                     resolved_device=current_device,
                     stage=current_stage,
                     message=current_message,
-                    total_batches=len(tasks),
+                    total_batches=total_batches,
                 )
+                batch_wall_seconds = max(
+                    0.0,
+                    float(
+                        (list(_batch_runtime_info.get("ocr_batch_wall_seconds", []) or [0.0]) or [0.0])[0]
+                        or 0.0
+                    ),
+                )
+                if (
+                    not slow_batch_downshifted
+                    and current_mode in {"parallel_gpu", "single_gpu"}
+                    and slow_batch_seconds > 0
+                    and len(list(task.get("page_numbers", []) or [])) > 1
+                    and batch_wall_seconds >= slow_batch_seconds
+                ):
+                    slow_batch_repartition_requested = True
+                    slow_batch_downshifted = True
+                    runtime_state["ocr_slow_batch_downshifted"] = True
+                    runtime_state["ocr_slow_batch_seconds"] = slow_batch_seconds
+                    print(
+                        "[PDF_OCR][SLOW_BATCH_DOWNSHIFT] "
+                        f"device={current_device or 'cpu'} mode={current_mode} "
+                        f"batch={int(task.get('batch_index', 0) or 0)} "
+                        f"batch_wall_seconds={batch_wall_seconds:.3f} "
+                        f"threshold_seconds={slow_batch_seconds:.3f}",
+                        flush=True,
+                    )
 
             batch_result = _execute_ocr_subset_tasks(
                 remaining_tasks,
@@ -1420,10 +1590,19 @@ def _extract_pdf_pages_with_paddleocr_vl_selected_pages(
             _merge_ocr_timing_info(runtime_state, batch_result.get("runtime_info"))
 
             remaining_tasks = list(batch_result.get("remaining_tasks", []) or [])
+            if slow_batch_repartition_requested and remaining_tasks:
+                original_remaining_count = len(remaining_tasks)
+                remaining_tasks = _replan_remaining_tasks_to_single_pages(remaining_tasks)
+                runtime_state["ocr_batch_count"] = int(runtime_state.get("ocr_batch_count", 0) or 0) + max(
+                    0,
+                    len(remaining_tasks) - original_remaining_count,
+                )
             if not remaining_tasks:
                 break
 
             failure_reason = str(batch_result.get("failure_reason", "") or "").strip().lower()
+            if not failure_reason and slow_batch_repartition_requested:
+                continue
             runtime_state["ocr_retry_reason"] = failure_reason
             if failure_reason.startswith("gpu"):
                 runtime_state["ocr_gpu_failure_reason"] = failure_reason
@@ -1446,6 +1625,15 @@ def _extract_pdf_pages_with_paddleocr_vl_selected_pages(
             _emit_retry_progress(current_mode, failure_reason)
 
         merged_pages.sort(key=lambda item: int(item.get("page_no", 0) or 0))
+        runtime_state["ocr_pages_emitted"] = len(merged_pages)
+        skipped_count = max(0, ocr_target_pages - len(merged_pages))
+        accounted_skips = int(runtime_state.get("ocr_pages_skipped_empty", 0) or 0) + int(
+            runtime_state.get("ocr_pages_skipped_short_text", 0) or 0
+        )
+        if accounted_skips < skipped_count:
+            runtime_state["ocr_pages_skipped_empty"] = int(runtime_state.get("ocr_pages_skipped_empty", 0) or 0) + (
+                skipped_count - accounted_skips
+            )
         runtime_state.update(
             _summarize_batch_wall_seconds(
                 list(runtime_state.get("ocr_batch_wall_seconds", []) or [])
@@ -1576,6 +1764,30 @@ def _dedupe_texts(values: List[str]) -> List[str]:
         seen.add(normalized)
         deduped.append(normalized)
     return deduped
+
+
+def _dedupe_texts_incremental(values: List[str]) -> List[str]:
+    deduped: List[str] = []
+    seen = set()
+    for text in values:
+        normalized = _normalize_block(text)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(normalized)
+    return deduped
+
+
+def _is_plain_ocr_payload(value: Any, depth: int = 0) -> bool:
+    if depth > 7:
+        return False
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return True
+    if isinstance(value, dict):
+        return all(isinstance(key, str) and _is_plain_ocr_payload(item, depth + 1) for key, item in value.items())
+    if isinstance(value, (list, tuple)):
+        return all(_is_plain_ocr_payload(item, depth + 1) for item in value)
+    return False
 
 
 def _append_unique(values: List[str], value: str):
@@ -1972,6 +2184,7 @@ def _build_pdf_result(
     attempted_ocr_pages: int = 0,
     ocr_runtime: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    runtime_payload = dict(ocr_runtime or {})
     ordered_pages: List[Dict[str, Any]] = []
     seen_pages = set()
     text_pages = 0
@@ -1981,7 +2194,7 @@ def _build_pdf_result(
         if page_no in seen_pages:
             continue
         seen_pages.add(page_no)
-        parser = str(page.get("parser", "") or "").strip() or "paddleocr_vl"
+        parser = _ocr_page_parser_name(page, runtime_payload)
         text = _normalize_block(str(page.get("text", "") or ""))
         lazy_ocr_hints = _dedupe_hint_lines(list(page.get("lazy_ocr_hints", []) or []))
         if not text and not lazy_ocr_hints:
@@ -2013,7 +2226,6 @@ def _build_pdf_result(
     elif warning_list or attempted_ocr_pages > 0 or failed_pages > 0:
         parser = "hybrid_pdf"
 
-    runtime_payload = dict(ocr_runtime or {})
     return {
         "parser": parser,
         "pages": ordered_pages,
@@ -2030,6 +2242,12 @@ def _build_pdf_result(
         "ocr_elapsed_seconds": runtime_payload.get("ocr_elapsed_seconds"),
         "ocr_pages_processed": runtime_payload.get("ocr_pages_processed"),
         "ocr_pages_per_minute": runtime_payload.get("ocr_pages_per_minute"),
+        "ocr_pages_attempted": runtime_payload.get("ocr_pages_attempted"),
+        "ocr_pages_emitted": runtime_payload.get("ocr_pages_emitted"),
+        "ocr_pages_skipped_empty": runtime_payload.get("ocr_pages_skipped_empty"),
+        "ocr_pages_skipped_short_text": runtime_payload.get("ocr_pages_skipped_short_text"),
+        "ocr_attempted_pages_per_minute": runtime_payload.get("ocr_attempted_pages_per_minute"),
+        "ocr_emitted_pages_per_minute": runtime_payload.get("ocr_emitted_pages_per_minute"),
         "ocr_target_pages": runtime_payload.get("ocr_target_pages"),
         "ocr_target_seconds": runtime_payload.get("ocr_target_seconds"),
         "ocr_target_met": runtime_payload.get("ocr_target_met"),
@@ -2038,6 +2256,9 @@ def _build_pdf_result(
         "ocr_predict_seconds": runtime_payload.get("ocr_predict_seconds"),
         "ocr_output_materialize_seconds": runtime_payload.get("ocr_output_materialize_seconds"),
         "ocr_payload_convert_seconds": runtime_payload.get("ocr_payload_convert_seconds"),
+        "ocr_fragment_collect_seconds": runtime_payload.get("ocr_fragment_collect_seconds"),
+        "ocr_page_dedupe_seconds": runtime_payload.get("ocr_page_dedupe_seconds"),
+        "ocr_page_join_seconds": runtime_payload.get("ocr_page_join_seconds"),
         "ocr_text_merge_seconds": runtime_payload.get("ocr_text_merge_seconds"),
         "ocr_merge_seconds": runtime_payload.get("ocr_merge_seconds"),
         "ocr_batch_count": runtime_payload.get("ocr_batch_count"),
@@ -2047,11 +2268,29 @@ def _build_pdf_result(
         "ocr_backend_fallback_used": runtime_payload.get("ocr_backend_fallback_used"),
         "ocr_hps_chunk_pages": runtime_payload.get("ocr_hps_chunk_pages"),
         "ocr_hps_max_concurrency": runtime_payload.get("ocr_hps_max_concurrency"),
+        "ocr_fast_pages": runtime_payload.get("ocr_fast_pages"),
+        "ocr_vl_pages": runtime_payload.get("ocr_vl_pages"),
+        "ocr_fast_seconds": runtime_payload.get("ocr_fast_seconds"),
+        "ocr_vl_seconds": runtime_payload.get("ocr_vl_seconds"),
+        "ocr_fast_avg_score": runtime_payload.get("ocr_fast_avg_score"),
+        "ocr_fast_pair_ratio": runtime_payload.get("ocr_fast_pair_ratio"),
+        "ocr_fast_orphan_ratio": runtime_payload.get("ocr_fast_orphan_ratio"),
+        "ocr_high_quality_requested": runtime_payload.get("ocr_high_quality_requested"),
         "ocr_batch_wall_seconds_mean": runtime_payload.get("ocr_batch_wall_seconds_mean"),
         "ocr_batch_wall_seconds_p50": runtime_payload.get("ocr_batch_wall_seconds_p50"),
         "ocr_batch_wall_seconds_p95": runtime_payload.get("ocr_batch_wall_seconds_p95"),
         "ocr_batch_wall_seconds_max": runtime_payload.get("ocr_batch_wall_seconds_max"),
     }
+
+
+def _ocr_page_parser_name(page: Dict[str, Any], runtime_payload: Dict[str, Any]) -> str:
+    parser = str(page.get("parser", "") or "").strip()
+    if parser:
+        return parser
+    backend = str(runtime_payload.get("ocr_backend_effective", "") or runtime_payload.get("ocr_backend", "") or "").strip()
+    if backend == "vl_only":
+        return "paddleocr_vl"
+    return backend or "paddleocr_vl"
 
 
 def _selected_ocr_first_page_numbers(pdf_path: str) -> Tuple[int, Optional[List[int]], bool]:
@@ -2336,6 +2575,30 @@ def _optional_env_json_dict(name: str) -> Optional[Dict[str, Any]]:
     return payload
 
 
+def _normalize_ocr_backend(value: str) -> str:
+    normalized = (value or "").strip().lower().replace("-", "_")
+    if normalized in {"", "default", "fast", "ppocr", "ppocr_fast", "ppocr_fast_v1"}:
+        return "ppocr_fast_v1"
+    if normalized in {"local", "vl", "vl_only", "paddleocr_vl", "paddleocrvl"}:
+        return "vl_only"
+    if normalized == "hps":
+        return "hps"
+    return normalized
+
+
+def _normalize_pdf_ocr_mode(value: str) -> str:
+    normalized = (value or "").strip().lower().replace("-", "_")
+    if normalized in {"", "auto", "default"}:
+        return ""
+    if normalized in {"fast", "ppocr", "ppocr_fast", "ppocr_fast_v1"}:
+        return "ppocr_fast_v1"
+    if normalized in {"high_quality", "highquality", "quality", "vl", "vl_only"}:
+        return "vl_only"
+    if normalized == "hps":
+        return "hps"
+    return ""
+
+
 def _ocr_optimization_profile() -> str:
     return (os.getenv("PDF_OCR_OPTIMIZATION_PROFILE", "") or "").strip().lower()
 
@@ -2472,6 +2735,22 @@ def _build_paddleocrvl_kwargs(
 
     if device:
         kwargs["device"] = device
+    return kwargs
+
+
+def _build_fast_paddleocr_kwargs(paddleocr_cls: Any, *, device: str) -> Dict[str, Any]:
+    params = _safe_signature_params(paddleocr_cls)
+    kwargs: Dict[str, Any] = {}
+    for key, value in {
+        "lang": os.getenv("PDF_OCR_FAST_LANG", "korean"),
+        "device": device,
+        "enable_hpi": _env_enabled("PDF_OCR_FAST_ENABLE_HPI", False),
+        "use_doc_orientation_classify": _env_enabled("PDF_OCR_FAST_USE_DOC_ORIENTATION", False),
+        "use_doc_unwarping": _env_enabled("PDF_OCR_FAST_USE_DOC_UNWARPING", False),
+        "use_textline_orientation": _env_enabled("PDF_OCR_FAST_USE_TEXTLINE_ORIENTATION", False),
+    }.items():
+        if key in params:
+            kwargs[key] = value
     return kwargs
 
 
@@ -2644,6 +2923,39 @@ def _load_ocr_model(model_name: str, device: Optional[str] = None):
         )
 
 
+def _load_fast_ocr_model(device: Optional[str] = None):
+    global _FAST_OCR_MODEL, _FAST_OCR_MODEL_KEY, _FAST_OCR_MODEL_DEVICE
+    resolved_device = (device or os.getenv("PDF_OCR_FAST_DEVICE", os.getenv("PDF_OCR_DEVICE", "cpu")) or "cpu").strip()
+    lang = (os.getenv("PDF_OCR_FAST_LANG", "korean") or "korean").strip()
+    _configure_paddle_gpu_memory_env(resolved_device)
+    cache_key = json.dumps(
+        {
+            "lang": lang,
+            "hpi": _env_enabled("PDF_OCR_FAST_ENABLE_HPI", False),
+            "doc_orientation": _env_enabled("PDF_OCR_FAST_USE_DOC_ORIENTATION", False),
+            "doc_unwarping": _env_enabled("PDF_OCR_FAST_USE_DOC_UNWARPING", False),
+            "textline_orientation": _env_enabled("PDF_OCR_FAST_USE_TEXTLINE_ORIENTATION", False),
+        },
+        sort_keys=True,
+    )
+    with _OCR_LOCK:
+        if (
+            _FAST_OCR_MODEL is not None
+            and _FAST_OCR_MODEL_KEY == cache_key
+            and _FAST_OCR_MODEL_DEVICE == resolved_device
+        ):
+            return _FAST_OCR_MODEL
+        try:
+            from paddleocr import PaddleOCR
+        except Exception as e:
+            raise RuntimeError("PaddleOCR fast OCR loader import failed. Check `paddleocr` installation.") from e
+        kwargs = _build_fast_paddleocr_kwargs(PaddleOCR, device=resolved_device)
+        _FAST_OCR_MODEL = PaddleOCR(**kwargs)
+        _FAST_OCR_MODEL_KEY = cache_key
+        _FAST_OCR_MODEL_DEVICE = resolved_device
+        return _FAST_OCR_MODEL
+
+
 def _predict_pdf(model: Any, pdf_path: str, max_pages: int):
     kwargs: Dict[str, Any] = {"input": pdf_path}
     if max_pages > 0:
@@ -2671,6 +2983,416 @@ def _materialize_ocr_output(raw_output: Any) -> Tuple[List[Any], float]:
     else:
         items = [raw_output]
     return items, round(time.monotonic() - started_at, 3)
+
+
+def _bbox_to_xyxy(value: Any) -> Optional[Tuple[float, float, float, float]]:
+    try:
+        if value is None:
+            return None
+        raw_points = value
+        if hasattr(raw_points, "tolist"):
+            raw_points = raw_points.tolist()
+        if isinstance(raw_points, dict):
+            for key in ("bbox", "box", "points", "poly", "dt_poly"):
+                if key in raw_points:
+                    return _bbox_to_xyxy(raw_points.get(key))
+            return None
+        if isinstance(raw_points, (list, tuple)) and len(raw_points) == 4 and all(
+            isinstance(item, (int, float)) for item in raw_points
+        ):
+            x1, y1, x2, y2 = [float(item) for item in raw_points]
+            return min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)
+        if isinstance(raw_points, (list, tuple)):
+            xs: List[float] = []
+            ys: List[float] = []
+            for point in raw_points:
+                if hasattr(point, "tolist"):
+                    point = point.tolist()
+                if isinstance(point, (list, tuple)) and len(point) >= 2:
+                    xs.append(float(point[0]))
+                    ys.append(float(point[1]))
+            if xs and ys:
+                return min(xs), min(ys), max(xs), max(ys)
+    except Exception:
+        return None
+    return None
+
+
+def _append_fast_line(
+    lines: List[Dict[str, Any]],
+    *,
+    text: Any,
+    score: Any = 1.0,
+    bbox: Any = None,
+    page_no: int = 1,
+) -> None:
+    normalized_text = _normalize_space(str(text or ""))
+    if not normalized_text:
+        return
+    xyxy = _bbox_to_xyxy(bbox)
+    if xyxy is None:
+        row_index = len(lines)
+        xyxy = (0.0, float(row_index * 20), float(max(40, len(normalized_text) * 12)), float(row_index * 20 + 16))
+    x1, y1, x2, y2 = xyxy
+    try:
+        resolved_score = float(score)
+    except (TypeError, ValueError):
+        resolved_score = 1.0
+    lines.append(
+        {
+            "page_no": max(1, int(page_no or 1)),
+            "text": normalized_text,
+            "score": max(0.0, min(1.0, resolved_score)),
+            "x1": float(x1),
+            "y1": float(y1),
+            "x2": float(x2),
+            "y2": float(y2),
+            "cx": (float(x1) + float(x2)) / 2.0,
+            "cy": (float(y1) + float(y2)) / 2.0,
+            "height": max(1.0, float(y2) - float(y1)),
+        }
+    )
+
+
+def _extract_fast_ocr_lines_from_payload(payload: Any, *, page_no: int) -> List[Dict[str, Any]]:
+    plain = _to_plain_data(payload)
+    lines: List[Dict[str, Any]] = []
+    if isinstance(plain, dict):
+        texts = plain.get("rec_texts") or plain.get("texts") or plain.get("text")
+        if isinstance(texts, str):
+            texts = [texts]
+        if isinstance(texts, list):
+            scores = plain.get("rec_scores") or plain.get("scores") or []
+            boxes = (
+                plain.get("rec_polys")
+                or plain.get("dt_polys")
+                or plain.get("rec_boxes")
+                or plain.get("boxes")
+                or plain.get("bbox")
+                or []
+            )
+            for idx, text in enumerate(texts):
+                score = scores[idx] if isinstance(scores, list) and idx < len(scores) else 1.0
+                bbox = boxes[idx] if isinstance(boxes, list) and idx < len(boxes) else None
+                _append_fast_line(lines, text=text, score=score, bbox=bbox, page_no=page_no)
+            if lines:
+                return lines
+    if isinstance(plain, list):
+        for item in plain:
+            if isinstance(item, dict):
+                item_lines = _extract_fast_ocr_lines_from_payload(item, page_no=page_no)
+                if item_lines:
+                    lines.extend(item_lines)
+                    continue
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                bbox = item[0]
+                text = ""
+                score = 1.0
+                content = item[1]
+                if isinstance(content, (list, tuple)):
+                    text = content[0] if content else ""
+                    score = content[1] if len(content) > 1 else 1.0
+                else:
+                    text = content
+                _append_fast_line(lines, text=text, score=score, bbox=bbox, page_no=page_no)
+    return lines
+
+
+def _definition_column_split_x(lines: List[Dict[str, Any]]) -> Optional[float]:
+    if len(lines) < 4:
+        return None
+    xs = sorted(float(line.get("x1", 0.0) or 0.0) for line in lines)
+    gaps: List[Tuple[float, int]] = []
+    for idx in range(len(xs) - 1):
+        gaps.append((xs[idx + 1] - xs[idx], idx))
+    if not gaps:
+        return None
+    gap, idx = max(gaps, key=lambda item: item[0])
+    if gap < max(24.0, (max(xs) - min(xs)) * 0.12):
+        return None
+    return (xs[idx] + xs[idx + 1]) / 2.0
+
+
+def _reconstruct_definition_page(lines: List[Dict[str, Any]]) -> Tuple[str, Dict[str, float]]:
+    ordered = sorted(lines, key=lambda line: (float(line.get("cy", 0.0)), float(line.get("x1", 0.0))))
+    if not ordered:
+        return "", {"pair_ratio": 0.0, "orphan_ratio": 1.0, "avg_score": 0.0}
+    avg_score = sum(float(line.get("score", 0.0) or 0.0) for line in ordered) / max(1, len(ordered))
+    split_x = _definition_column_split_x(ordered)
+    if split_x is None:
+        text = "\n".join(_normalize_space(str(line.get("text", "") or "")) for line in ordered if line.get("text"))
+        return text, {"pair_ratio": 0.0, "orphan_ratio": 0.0 if text else 1.0, "avg_score": avg_score}
+
+    left_lines = [line for line in ordered if float(line.get("cx", 0.0) or 0.0) <= split_x]
+    right_lines = [line for line in ordered if float(line.get("cx", 0.0) or 0.0) > split_x]
+    if not left_lines or not right_lines:
+        text = "\n".join(_normalize_space(str(line.get("text", "") or "")) for line in ordered if line.get("text"))
+        return text, {"pair_ratio": 0.0, "orphan_ratio": 0.0 if text else 1.0, "avg_score": avg_score}
+
+    median_height = sorted(float(line.get("height", 12.0) or 12.0) for line in ordered)[len(ordered) // 2]
+    tolerance = max(8.0, median_height * 0.75)
+    rows: List[str] = []
+    matched_right: set[int] = set()
+    paired = 0
+    sorted_left = sorted(left_lines, key=lambda line: float(line.get("cy", 0.0) or 0.0))
+    sorted_right = sorted(right_lines, key=lambda line: (float(line.get("cy", 0.0)), float(line.get("x1", 0.0))))
+    for left_idx, left in enumerate(sorted_left):
+        term = _normalize_space(str(left.get("text", "") or ""))
+        if not term:
+            continue
+        y_start = float(left.get("cy", 0.0) or 0.0) - tolerance
+        if left_idx + 1 < len(sorted_left):
+            y_end = float(sorted_left[left_idx + 1].get("cy", 0.0) or 0.0) - tolerance
+        else:
+            y_end = float("inf")
+        desc_parts: List[str] = []
+        for right_idx, right in enumerate(sorted_right):
+            if right_idx in matched_right:
+                continue
+            cy = float(right.get("cy", 0.0) or 0.0)
+            if cy < y_start or cy >= y_end:
+                continue
+            desc = _normalize_space(str(right.get("text", "") or ""))
+            if desc:
+                desc_parts.append(desc)
+                matched_right.add(right_idx)
+        if desc_parts:
+            paired += 1
+            rows.append(f"정의: {term}\n설명: {' '.join(desc_parts)}")
+        else:
+            rows.append(f"정의: {term}")
+    for right_idx, right in enumerate(sorted_right):
+        if right_idx in matched_right:
+            continue
+        desc = _normalize_space(str(right.get("text", "") or ""))
+        if desc:
+            if rows:
+                rows[-1] = f"{rows[-1]} {desc}"
+                matched_right.add(right_idx)
+            else:
+                rows.append(desc)
+    orphan_count = max(0, len(left_lines) - paired) + max(0, len(right_lines) - len(matched_right))
+    pair_ratio = paired / max(1, len(left_lines))
+    orphan_ratio = orphan_count / max(1, len(left_lines) + len(right_lines))
+    return "\n\n".join(row for row in rows if row.strip()), {
+        "pair_ratio": round(pair_ratio, 3),
+        "orphan_ratio": round(orphan_ratio, 3),
+        "avg_score": round(avg_score, 3),
+    }
+
+
+def _fast_quality_ok(text: str, metrics: Dict[str, float]) -> bool:
+    if len(_normalize_block(text)) < max(1, int(os.getenv("PDF_OCR_FAST_MIN_TEXT_CHARS", "80") or "80")):
+        return False
+    if float(metrics.get("avg_score", 0.0) or 0.0) < _to_float(os.getenv("PDF_OCR_FAST_MIN_SCORE", "0.72"), 0.72):
+        return False
+    if float(metrics.get("orphan_ratio", 1.0) or 1.0) > _to_float(os.getenv("PDF_OCR_FAST_MAX_ORPHAN_RATIO", "0.35"), 0.35):
+        return False
+    if float(metrics.get("pair_ratio", 0.0) or 0.0) < _to_float(os.getenv("PDF_OCR_FAST_MIN_PAIR_RATIO", "0.45"), 0.45):
+        # Plain single-column pages are acceptable when no column split was found.
+        return bool(float(metrics.get("pair_ratio", 0.0) or 0.0) == 0.0 and float(metrics.get("orphan_ratio", 0.0) or 0.0) == 0.0)
+    return True
+
+
+def _predict_fast_ocr(model: Any, pdf_path: str, max_pages: int) -> Any:
+    predict = getattr(model, "predict", None)
+    if callable(predict):
+        try:
+            return predict(input=pdf_path, page_num=max_pages)
+        except TypeError:
+            try:
+                return predict(input=pdf_path)
+            except TypeError:
+                return predict(pdf_path)
+    ocr = getattr(model, "ocr", None)
+    if callable(ocr):
+        try:
+            return ocr(pdf_path)
+        except TypeError:
+            return ocr(img=pdf_path)
+    raise RuntimeError("PaddleOCR fast model does not expose predict() or ocr().")
+
+
+def _execute_ppocr_fast_v1_with_runtime(
+    pdf_path: str,
+    progress_callback: Optional[Callable[[int, str, str], None]] = None,
+    *,
+    page_numbers: Optional[List[int]] = None,
+    total_document_pages: Optional[int] = None,
+    completed_pages_base: int = 0,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    if not os.path.exists(pdf_path):
+        raise FileNotFoundError(f"PDF 파일을 찾을 수 없습니다: {pdf_path}")
+    started_at = time.monotonic()
+    total_pages = int(total_document_pages or 0) or _count_pdf_pages(pdf_path)
+    max_pages = max(1, int(os.getenv("PDF_OCR_MAX_PAGES", "400") or "400"))
+    selected_pages = sorted(
+        {
+            int(page_no)
+            for page_no in (
+                page_numbers
+                if page_numbers is not None
+                else range(1, min(max_pages, total_pages or max_pages) + 1)
+            )
+            if int(page_no) > 0 and int(page_no) <= max_pages
+        }
+    )
+    if not selected_pages:
+        return [], {"ocr_backend": "ppocr_fast_v1", "ocr_pages_processed": 0}
+    device = (os.getenv("PDF_OCR_FAST_DEVICE", os.getenv("PDF_OCR_DEVICE", "cpu")) or "cpu").strip()
+    subset_path = pdf_path
+    subset_map = {idx + 1: page_no for idx, page_no in enumerate(selected_pages)}
+    should_remove_subset = False
+    if selected_pages != list(range(1, len(selected_pages) + 1)) or len(selected_pages) != (total_pages or len(selected_pages)):
+        subset_path, subset_map = _build_pdf_subset_for_pages(pdf_path, selected_pages)
+        should_remove_subset = True
+    runtime_info: Dict[str, Any] = {
+        "ocr_backend": "ppocr_fast_v1",
+        "ocr_backend_attempted": "ppocr_fast_v1",
+        "ocr_backend_effective": "ppocr_fast_v1",
+        "ocr_backend_fallback_used": False,
+        "ocr_device_attempted": device,
+        "ocr_device_effective": device,
+        "ocr_gpu_fallback_used": False,
+        "ocr_gpu_failure_reason": "",
+        "ocr_pages_attempted": len(selected_pages),
+        "ocr_fast_pages": 0,
+        "ocr_vl_pages": 0,
+        "ocr_high_quality_requested": False,
+    }
+    try:
+        _emit_progress(
+            progress_callback,
+            34,
+            "PaddleOCR fast OCR 모델을 준비하는 중입니다.",
+            "load_pdf_ocr_model",
+            current_page=max(0, int(completed_pages_base or 0)),
+            total_pages=max(0, int(total_pages or 0)),
+            ocr_target_pages=len(selected_pages),
+            ocr_completed_pages=0,
+        )
+        load_started = time.monotonic()
+        model = _load_fast_ocr_model(device=device)
+        runtime_info["ocr_model_load_seconds"] = round(time.monotonic() - load_started, 3)
+        _emit_progress(
+            progress_callback,
+            42,
+            "PaddleOCR fast OCR을 실행하는 중입니다.",
+            "run_pdf_ocr",
+            current_page=max(0, int(completed_pages_base or 0)),
+            total_pages=max(0, int(total_pages or 0)),
+            ocr_target_pages=len(selected_pages),
+            ocr_completed_pages=0,
+        )
+        predict_started = time.monotonic()
+        print(
+            f"[PDF_OCR][FAST_START] stage=run_pdf_ocr backend=ppocr_fast_v1 "
+            f"device={device or 'cpu'} pages={len(selected_pages)} pdf={os.path.basename(pdf_path)}",
+            flush=True,
+        )
+        raw_output = _predict_fast_ocr(model, subset_path, max_pages=len(selected_pages))
+        runtime_info["ocr_predict_seconds"] = round(time.monotonic() - predict_started, 3)
+        raw_items, materialize_seconds = _materialize_ocr_output(raw_output)
+        runtime_info["ocr_output_materialize_seconds"] = materialize_seconds
+        merge_started = time.monotonic()
+        page_payloads = raw_items
+        if raw_items and isinstance(raw_items[0], (list, tuple)) and len(raw_items[0]) >= 2:
+            first_bbox = _bbox_to_xyxy(raw_items[0][0])
+            if first_bbox is not None:
+                page_payloads = [raw_items]
+        pages: List[Dict[str, Any]] = []
+        all_scores: List[float] = []
+        pair_ratios: List[float] = []
+        orphan_ratios: List[float] = []
+        fallback_pages: List[int] = []
+        for item_index, item in enumerate(page_payloads, start=1):
+            original_page_no = int(subset_map.get(item_index, item_index) or item_index)
+            lines = _extract_fast_ocr_lines_from_payload(item, page_no=original_page_no)
+            if not lines and len(page_payloads) == 1:
+                lines = _extract_fast_ocr_lines_from_payload(raw_items, page_no=original_page_no)
+            text, metrics = _reconstruct_definition_page(lines)
+            all_scores.append(float(metrics.get("avg_score", 0.0) or 0.0))
+            pair_ratios.append(float(metrics.get("pair_ratio", 0.0) or 0.0))
+            orphan_ratios.append(float(metrics.get("orphan_ratio", 0.0) or 0.0))
+            if _fast_quality_ok(text, metrics):
+                pages.append(
+                    {
+                        "page_no": original_page_no,
+                        "text": text,
+                        "parser": "ppocr_fast_v1",
+                    }
+                )
+            else:
+                fallback_pages.append(original_page_no)
+                if text.strip():
+                    pages.append(
+                        {
+                            "page_no": original_page_no,
+                            "text": text,
+                            "parser": "ppocr_fast_v1",
+                        }
+                    )
+            _emit_progress(
+                progress_callback,
+                42 + int(round((item_index / max(1, len(page_payloads))) * 13)),
+                f"PaddleOCR fast OCR 결과를 정리하는 중입니다. ({item_index}/{len(page_payloads)})",
+                "merge_pdf_ocr",
+                current_page=max(0, int(completed_pages_base or 0)) + item_index,
+                total_pages=max(0, int(total_pages or 0)),
+                ocr_target_pages=len(selected_pages),
+                ocr_completed_pages=item_index,
+                ocr_backend_effective="ppocr_fast_v1",
+            )
+        runtime_info["ocr_text_merge_seconds"] = round(time.monotonic() - merge_started, 3)
+        runtime_info["ocr_merge_seconds"] = runtime_info["ocr_text_merge_seconds"]
+        runtime_info["ocr_fast_seconds"] = round(time.monotonic() - started_at, 3)
+        runtime_info["ocr_fast_pages"] = len(pages)
+        runtime_info["ocr_fast_avg_score"] = round(sum(all_scores) / max(1, len(all_scores)), 3)
+        runtime_info["ocr_fast_pair_ratio"] = round(sum(pair_ratios) / max(1, len(pair_ratios)), 3)
+        runtime_info["ocr_fast_orphan_ratio"] = round(sum(orphan_ratios) / max(1, len(orphan_ratios)), 3)
+        if fallback_pages and _env_enabled("PDF_OCR_FAST_VL_FALLBACK", False):
+            vl_started = time.monotonic()
+            vl_pages, vl_runtime = _execute_local_paddleocr_vl_with_runtime(
+                pdf_path,
+                progress_callback=progress_callback,
+                page_numbers=fallback_pages,
+                total_document_pages=total_pages or None,
+                completed_pages_base=max(0, int(completed_pages_base or 0)) + len(pages),
+            )
+            runtime_info["ocr_vl_seconds"] = round(time.monotonic() - vl_started, 3)
+            runtime_info["ocr_vl_pages"] = len(vl_pages)
+            runtime_info["ocr_backend_fallback_used"] = True
+            by_page = {int(page.get("page_no", 0) or 0): page for page in pages}
+            for page in vl_pages:
+                by_page[int(page.get("page_no", 0) or 0)] = {
+                    "page_no": int(page.get("page_no", 0) or 0),
+                    "text": str(page.get("text", "") or ""),
+                    "parser": "paddleocr_vl",
+                }
+            pages = [by_page[key] for key in sorted(by_page)]
+            _merge_ocr_timing_info(runtime_info, vl_runtime)
+        else:
+            runtime_info["ocr_vl_seconds"] = 0.0
+            runtime_info["ocr_vl_pages"] = 0
+        pages.sort(key=lambda page: int(page.get("page_no", 0) or 0))
+        runtime_info["ocr_pages_emitted"] = len(pages)
+        runtime_info["ocr_pages_skipped_empty"] = max(0, len(selected_pages) - len(pages))
+        runtime_info["ocr_pages_skipped_short_text"] = 0
+        _finalize_ocr_runtime_info(runtime_info, started_at=started_at, pages=pages)
+        print(
+            f"[PDF_OCR][FAST_DONE] stage=run_pdf_ocr backend=ppocr_fast_v1 "
+            f"fast_pages={runtime_info['ocr_fast_pages']} vl_pages={runtime_info['ocr_vl_pages']} "
+            f"avg_score={runtime_info['ocr_fast_avg_score']} pair_ratio={runtime_info['ocr_fast_pair_ratio']} "
+            f"orphan_ratio={runtime_info['ocr_fast_orphan_ratio']}",
+            flush=True,
+        )
+        return pages, runtime_info
+    finally:
+        if should_remove_subset:
+            try:
+                os.remove(subset_path)
+            except OSError:
+                pass
 
 
 def _hps_page_text(item: Dict[str, Any]) -> str:
@@ -2860,6 +3582,12 @@ def _extract_pdf_pages_with_paddleocr_vl_serial(
     page_iter = raw_output
     total_items = max(1, len(raw_output))
     payload_convert_seconds = 0.0
+    fragment_collect_seconds = 0.0
+    page_dedupe_seconds = 0.0
+    page_join_seconds = 0.0
+    pages_attempted = 0
+    pages_skipped_empty = 0
+    pages_skipped_short_text = 0
 
     try:
         try:
@@ -2884,19 +3612,32 @@ def _extract_pdf_pages_with_paddleocr_vl_serial(
                             **dict(progress_meta or {}),
                         )
 
+                pages_attempted += 1
                 convert_started_at = time.monotonic()
-                payload = _to_plain_data(item)
-                payload_convert_seconds += time.monotonic() - convert_started_at
+                if _is_plain_ocr_payload(item):
+                    payload = item
+                else:
+                    payload = _to_plain_data(item)
+                    payload_convert_seconds += time.monotonic() - convert_started_at
                 page_no = _extract_page_no(payload, fallback=fallback_page, max_page=resolved_max_pages)
                 fallback_page = max(fallback_page + 1, page_no + 1)
 
                 fragments: List[str] = []
+                collect_started_at = time.monotonic()
                 _collect_text_fragments(payload, fragments)
-                deduped = _dedupe_texts(fragments)
+                fragment_collect_seconds += time.monotonic() - collect_started_at
+                if not fragments:
+                    pages_skipped_empty += 1
+                    continue
+                dedupe_started_at = time.monotonic()
+                deduped = _dedupe_texts_incremental(fragments)
+                page_dedupe_seconds += time.monotonic() - dedupe_started_at
                 if not deduped:
+                    pages_skipped_empty += 1
                     continue
                 text = "\n".join(deduped).strip()
                 if len(text) < resolved_min_text_chars:
+                    pages_skipped_short_text += 1
                     continue
                 merged_by_page.setdefault(page_no, []).append(text)
         finally:
@@ -2905,16 +3646,26 @@ def _extract_pdf_pages_with_paddleocr_vl_serial(
 
         pages: List[Dict[str, Any]] = []
         for page_no in sorted(merged_by_page.keys()):
-            page_text = "\n".join(_dedupe_texts(merged_by_page[page_no])).strip()
+            page_join_started_at = time.monotonic()
+            page_text = "\n".join(_dedupe_texts_incremental(merged_by_page[page_no])).strip()
+            page_join_seconds += time.monotonic() - page_join_started_at
             if len(page_text) < resolved_min_text_chars:
+                pages_skipped_short_text += 1
                 continue
             pages.append({"page_no": int(page_no), "text": page_text})
         timing_info["ocr_merge_seconds"] = round(time.monotonic() - merge_started_at, 3)
         timing_info["ocr_payload_convert_seconds"] = round(payload_convert_seconds, 3)
+        timing_info["ocr_fragment_collect_seconds"] = round(fragment_collect_seconds, 3)
+        timing_info["ocr_page_dedupe_seconds"] = round(page_dedupe_seconds, 3)
+        timing_info["ocr_page_join_seconds"] = round(page_join_seconds, 3)
         timing_info["ocr_text_merge_seconds"] = round(
-            max(0.0, float(timing_info["ocr_merge_seconds"]) - payload_convert_seconds),
+            fragment_collect_seconds + page_dedupe_seconds + page_join_seconds,
             3,
         )
+        timing_info["ocr_pages_attempted"] = int(pages_attempted)
+        timing_info["ocr_pages_emitted"] = int(len(pages))
+        timing_info["ocr_pages_skipped_empty"] = int(pages_skipped_empty)
+        timing_info["ocr_pages_skipped_short_text"] = int(pages_skipped_short_text)
         _set_last_ocr_serial_timing_info(timing_info)
 
         if pages:
@@ -3007,35 +3758,54 @@ def _finalize_ocr_runtime_info(
     pages: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
     elapsed_seconds = max(0.0, time.monotonic() - float(started_at))
-    pages_processed = len(list(pages or []))
-    pages_per_minute = (pages_processed / elapsed_seconds * 60.0) if elapsed_seconds > 0 else 0.0
+    emitted_pages = int(runtime_info.get("ocr_pages_emitted", len(list(pages or []))) or len(list(pages or [])))
+    attempted_pages = int(runtime_info.get("ocr_pages_attempted", emitted_pages) or emitted_pages)
+    skipped_empty = int(runtime_info.get("ocr_pages_skipped_empty", 0) or 0)
+    skipped_short_text = int(runtime_info.get("ocr_pages_skipped_short_text", 0) or 0)
+    attempted_pages_per_minute = (attempted_pages / elapsed_seconds * 60.0) if elapsed_seconds > 0 else 0.0
+    emitted_pages_per_minute = (emitted_pages / elapsed_seconds * 60.0) if elapsed_seconds > 0 else 0.0
     target_pages = max(0, int(os.getenv("PDF_OCR_TARGET_PAGES", os.getenv("PDF_OCR_MAX_PAGES", "200")) or "0"))
     target_seconds = max(0.0, _to_float(os.getenv("PDF_OCR_TARGET_SECONDS", "300"), 300.0))
     runtime_info["ocr_elapsed_seconds"] = round(elapsed_seconds, 3)
-    runtime_info["ocr_pages_processed"] = pages_processed
-    runtime_info["ocr_pages_per_minute"] = round(pages_per_minute, 3)
+    runtime_info["ocr_pages_processed"] = emitted_pages
+    runtime_info["ocr_pages_per_minute"] = round(emitted_pages_per_minute, 3)
+    runtime_info["ocr_pages_attempted"] = attempted_pages
+    runtime_info["ocr_pages_emitted"] = emitted_pages
+    runtime_info["ocr_pages_skipped_empty"] = skipped_empty
+    runtime_info["ocr_pages_skipped_short_text"] = skipped_short_text
+    runtime_info["ocr_attempted_pages_per_minute"] = round(attempted_pages_per_minute, 3)
+    runtime_info["ocr_emitted_pages_per_minute"] = round(emitted_pages_per_minute, 3)
     runtime_info["ocr_target_pages"] = target_pages
     runtime_info["ocr_target_seconds"] = target_seconds
     runtime_info["ocr_target_met"] = bool(
         target_pages > 0
         and target_seconds > 0
-        and pages_processed >= target_pages
+        and emitted_pages >= target_pages
         and elapsed_seconds <= target_seconds
     )
     print(
         "[PDF_OCR][RUNTIME] "
         f"elapsed_seconds={runtime_info['ocr_elapsed_seconds']} "
-        f"pages_processed={runtime_info['ocr_pages_processed']} "
-        f"pages_per_minute={runtime_info['ocr_pages_per_minute']} "
+        f"pages_attempted={runtime_info['ocr_pages_attempted']} "
+        f"pages_emitted={runtime_info['ocr_pages_emitted']} "
+        f"pages_skipped_empty={runtime_info['ocr_pages_skipped_empty']} "
+        f"pages_skipped_short_text={runtime_info['ocr_pages_skipped_short_text']} "
+        f"attempted_pages_per_minute={runtime_info['ocr_attempted_pages_per_minute']} "
+        f"emitted_pages_per_minute={runtime_info['ocr_emitted_pages_per_minute']} "
         f"batch_count={int(runtime_info.get('ocr_batch_count', 0) or 0)} "
         f"subset_build_seconds={float(runtime_info.get('ocr_subset_build_seconds', 0.0) or 0.0):.3f} "
         f"model_load_seconds={float(runtime_info.get('ocr_model_load_seconds', 0.0) or 0.0):.3f} "
         f"predict_seconds={float(runtime_info.get('ocr_predict_seconds', 0.0) or 0.0):.3f} "
         f"materialize_seconds={float(runtime_info.get('ocr_output_materialize_seconds', 0.0) or 0.0):.3f} "
         f"payload_convert_seconds={float(runtime_info.get('ocr_payload_convert_seconds', 0.0) or 0.0):.3f} "
+        f"fragment_collect_seconds={float(runtime_info.get('ocr_fragment_collect_seconds', 0.0) or 0.0):.3f} "
+        f"page_dedupe_seconds={float(runtime_info.get('ocr_page_dedupe_seconds', 0.0) or 0.0):.3f} "
+        f"page_join_seconds={float(runtime_info.get('ocr_page_join_seconds', 0.0) or 0.0):.3f} "
         f"text_merge_seconds={float(runtime_info.get('ocr_text_merge_seconds', 0.0) or 0.0):.3f} "
         f"merge_seconds={float(runtime_info.get('ocr_merge_seconds', 0.0) or 0.0):.3f} "
         f"backend={str(runtime_info.get('ocr_backend_effective', runtime_info.get('ocr_backend', 'local')) or 'local')} "
+        f"fast_pages={int(runtime_info.get('ocr_fast_pages', 0) or 0)} "
+        f"vl_pages={int(runtime_info.get('ocr_vl_pages', 0) or 0)} "
         f"batch_p50_seconds={float(runtime_info.get('ocr_batch_wall_seconds_p50', 0.0) or 0.0):.3f} "
         f"batch_p95_seconds={float(runtime_info.get('ocr_batch_wall_seconds_p95', 0.0) or 0.0):.3f} "
         f"target_met={bool(runtime_info.get('ocr_target_met', False))}"
@@ -3286,20 +4056,28 @@ def _execute_paddleocr_vl_with_runtime(
     page_numbers: Optional[List[int]] = None,
     total_document_pages: Optional[int] = None,
     completed_pages_base: int = 0,
+    backend_override: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    backend = (os.getenv("PDF_OCR_BACKEND", "local") or "local").strip().lower()
+    backend = _normalize_ocr_backend(backend_override or os.getenv("PDF_OCR_BACKEND", "ppocr_fast_v1"))
     kwargs = {
         "progress_callback": progress_callback,
         "page_numbers": page_numbers,
         "total_document_pages": total_document_pages,
         "completed_pages_base": completed_pages_base,
     }
+    if backend == "ppocr_fast_v1":
+        return _execute_ppocr_fast_v1_with_runtime(pdf_path, **kwargs)
     if backend != "hps":
         pages, runtime_info = _execute_local_paddleocr_vl_with_runtime(pdf_path, **kwargs)
-        runtime_info.setdefault("ocr_backend", "local")
-        runtime_info.setdefault("ocr_backend_attempted", "local")
-        runtime_info.setdefault("ocr_backend_effective", "local")
+        runtime_info["ocr_backend"] = "vl_only"
+        runtime_info["ocr_backend_attempted"] = "vl_only"
+        runtime_info["ocr_backend_effective"] = "vl_only"
         runtime_info.setdefault("ocr_backend_fallback_used", False)
+        runtime_info.setdefault("ocr_high_quality_requested", bool(backend == "vl_only"))
+        runtime_info.setdefault("ocr_fast_pages", 0)
+        runtime_info.setdefault("ocr_fast_seconds", 0.0)
+        runtime_info.setdefault("ocr_vl_pages", len(pages))
+        runtime_info.setdefault("ocr_vl_seconds", float(runtime_info.get("ocr_elapsed_seconds", 0.0) or 0.0))
         return pages, runtime_info
     try:
         return _execute_hps_ocr_with_runtime(pdf_path, **kwargs)
@@ -3339,6 +4117,7 @@ def extract_pdf_pages_with_paddleocr_vl(
         page_numbers=page_numbers,
         total_document_pages=total_document_pages,
         completed_pages_base=completed_pages_base,
+        backend_override="vl_only",
     )
     _set_last_ocr_runtime_info(_runtime_info)
     return pages
@@ -3349,12 +4128,15 @@ def extract_pdf_pages(
     progress_callback: Optional[Callable[[int, str, str], None]] = None,
     *,
     force_upload_ocr: bool = False,
+    pdf_ocr_mode: str = "",
 ) -> Dict[str, Any]:
     if not os.path.exists(pdf_path):
         raise FileNotFoundError(f"PDF 파일을 찾을 수 없습니다: {pdf_path}")
 
     parse_mode = _normalize_pdf_parse_mode(os.getenv("PDF_PARSE_MODE", "ocr_first"))
     text_extractor = _normalize_pdf_text_extractor(os.getenv("PDF_TEXT_EXTRACTOR", "pymupdf"))
+    requested_backend = _normalize_pdf_ocr_mode(pdf_ocr_mode) or _normalize_ocr_backend(os.getenv("PDF_OCR_BACKEND", "ppocr_fast_v1"))
+    high_quality_requested = requested_backend == "vl_only"
     min_text_chars = max(1, int(os.getenv("PDF_TEXT_MIN_CHARS", os.getenv("PDF_OCR_MIN_TEXT_CHARS", "4"))))
     min_nonspace_ratio = max(0.0, min(1.0, _to_float(os.getenv("PDF_TEXT_MIN_NONSPACE_RATIO", "0.20"), 0.20)))
 
@@ -3367,14 +4149,16 @@ def extract_pdf_pages(
         warnings: List[str] = []
         _set_last_ocr_runtime_info({})
         try:
-            ocr_pages_raw = extract_pdf_pages_with_paddleocr_vl(
+            ocr_pages_raw, ocr_runtime = _execute_paddleocr_vl_with_runtime(
                 pdf_path,
                 progress_callback=progress_callback,
                 page_numbers=selected_page_numbers,
                 total_document_pages=ocr_total_pages or None,
                 completed_pages_base=0,
+                backend_override=requested_backend,
             )
-            ocr_runtime = _peek_last_ocr_runtime_info()
+            ocr_runtime["ocr_high_quality_requested"] = high_quality_requested
+            _set_last_ocr_runtime_info(ocr_runtime)
         except Exception as exc:
             if (
                 _ocr_failure_reason(exc) == "gpu_kernel_incompatible"
@@ -3406,7 +4190,7 @@ def extract_pdf_pages(
             {
                 "page_no": max(1, int(page.get("page_no", 0) or 0)),
                 "text": _normalize_block(str(page.get("text", "") or "")),
-                "parser": "paddleocr_vl",
+                "parser": _ocr_page_parser_name(page, ocr_runtime),
             }
             for page in list(ocr_pages_raw or [])
         ]
@@ -3464,19 +4248,21 @@ def extract_pdf_pages(
             )
         ) if ocr_total_pages > 0 else None
         _set_last_ocr_runtime_info({})
-        ocr_pages = extract_pdf_pages_with_paddleocr_vl(
+        ocr_pages, ocr_runtime = _execute_paddleocr_vl_with_runtime(
             pdf_path,
             progress_callback=progress_callback,
             page_numbers=selected_page_numbers,
             total_document_pages=ocr_total_pages or None,
             completed_pages_base=0,
+            backend_override=requested_backend,
         )
-        ocr_runtime = _peek_last_ocr_runtime_info()
+        ocr_runtime["ocr_high_quality_requested"] = high_quality_requested
+        _set_last_ocr_runtime_info(ocr_runtime)
         wrapped_pages = [
             {
                 "page_no": max(1, int(page.get("page_no", 0) or 0)),
                 "text": _normalize_block(str(page.get("text", "") or "")),
-                "parser": "paddleocr_vl",
+                "parser": _ocr_page_parser_name(page, ocr_runtime),
             }
             for page in ocr_pages
         ]
@@ -3495,19 +4281,21 @@ def extract_pdf_pages(
             )
         ) if ocr_total_pages > 0 else None
         _set_last_ocr_runtime_info({})
-        ocr_pages = extract_pdf_pages_with_paddleocr_vl(
+        ocr_pages, ocr_runtime = _execute_paddleocr_vl_with_runtime(
             pdf_path,
             progress_callback=progress_callback,
             page_numbers=selected_page_numbers,
             total_document_pages=ocr_total_pages or None,
             completed_pages_base=0,
+            backend_override=requested_backend,
         )
-        ocr_runtime = _peek_last_ocr_runtime_info()
+        ocr_runtime["ocr_high_quality_requested"] = high_quality_requested
+        _set_last_ocr_runtime_info(ocr_runtime)
         wrapped_pages = [
             {
                 "page_no": max(1, int(page.get("page_no", 0) or 0)),
                 "text": _normalize_block(str(page.get("text", "") or "")),
-                "parser": "paddleocr_vl",
+                "parser": _ocr_page_parser_name(page, ocr_runtime),
             }
             for page in ocr_pages
         ]
@@ -3620,14 +4408,16 @@ def extract_pdf_pages(
                 ocr_completed_pages=0,
             )
         _set_last_ocr_runtime_info({})
-        ocr_pages_raw = extract_pdf_pages_with_paddleocr_vl(
+        ocr_pages_raw, ocr_runtime = _execute_paddleocr_vl_with_runtime(
             pdf_path,
             progress_callback=progress_callback,
             page_numbers=ocr_candidate_pages,
             total_document_pages=total_pages or None,
             completed_pages_base=len(text_pages),
+            backend_override=requested_backend,
         )
-        ocr_runtime = _peek_last_ocr_runtime_info()
+        ocr_runtime["ocr_high_quality_requested"] = high_quality_requested
+        _set_last_ocr_runtime_info(ocr_runtime)
     except Exception:
         if text_pages:
             warnings.append("ocr_fallback_failed")
@@ -3655,7 +4445,7 @@ def extract_pdf_pages(
         merged_pages[page_no] = {
             "page_no": page_no,
             "text": page_text,
-            "parser": "paddleocr_vl",
+            "parser": _ocr_page_parser_name(page, ocr_runtime),
         }
 
     safe_total_pages = total_pages

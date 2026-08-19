@@ -17,6 +17,7 @@ from fastapi import FastAPI, UploadFile, File, Form, Request, Response
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from starlette.background import BackgroundTask
 
 from src.citation_labels import canonicalize_doc_citations, render_answer_with_bottom_citations
 from src.answer_validation import (
@@ -36,6 +37,7 @@ from src.chat_policy import (
     explain_scope_nudge_reason,
     should_prompt_for_narrower_summary,
 )
+from src.chat_store import is_failed_history_answer_text
 from src.auth_store import AuthStore
 from src.conversation_mode import (
     is_live_info_request,
@@ -62,6 +64,7 @@ from src.compass_ai import (
 )
 from src.kb_engine_registry import KBEngineRegistry
 from src.ontology_store import OntologyStore
+from src.persistence_retention import rotate_file_if_oversize
 from src.query_orchestration import decide_rerank_usage, run_parallel_helper_tasks
 from src.query_rewrite import resolve_effective_query, should_attempt_followup_rewrite
 from src.rag import RAGEngine, list_kbs, get_kb_files, rename_kb_dir, delete_kb_dir, delete_file_from_kb
@@ -104,6 +107,14 @@ APP_DB_PATH = Path(os.getenv("COMPASSLM_APP_DB_PATH", str(PROJECT_ROOT / "data" 
 ADMIN_FEEDBACK_LOG_PATH = Path(
     os.getenv("ADMIN_FEEDBACK_LOG_PATH", str(LOGS_DIR / "admin_feedback.jsonl"))
 ).resolve()
+OPERATIONAL_JSONL_MAX_BYTES = max(
+    1024 * 1024,
+    int(os.getenv("OPERATIONAL_JSONL_MAX_BYTES", str(20 * 1024 * 1024))),
+)
+OPERATIONAL_JSONL_BACKUP_COUNT = max(
+    1,
+    int(os.getenv("OPERATIONAL_JSONL_BACKUP_COUNT", "5")),
+)
 
 # Configuration
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -177,6 +188,10 @@ UPLOAD_QUEUE_MAXSIZE = max(4, int(os.getenv("UPLOAD_QUEUE_MAXSIZE", "200")))
 UPLOAD_WORKER_COUNT = max(1, int(os.getenv("UPLOAD_WORKER_COUNT", "1")))
 UPLOAD_FAST_WORKER_COUNT = max(1, int(os.getenv("UPLOAD_FAST_WORKER_COUNT", "1")))
 UPLOAD_JOB_RETENTION_SECONDS = max(300, int(os.getenv("UPLOAD_JOB_RETENTION_SECONDS", "86400")))
+UPLOAD_JOB_RETENTION_MAX_ROWS = max(100, int(os.getenv("UPLOAD_JOB_RETENTION_MAX_ROWS", "5000")))
+UPLOAD_JOB_PRUNE_INTERVAL_SECONDS = max(60, int(os.getenv("UPLOAD_JOB_PRUNE_INTERVAL_SECONDS", "3600")))
+UPLOAD_JOB_PRUNE_BATCH_SIZE = max(100, int(os.getenv("UPLOAD_JOB_PRUNE_BATCH_SIZE", "1000")))
+AUTH_SESSION_PRUNE_LIMIT = max(100, int(os.getenv("AUTH_SESSION_PRUNE_LIMIT", "1000")))
 UPLOAD_JOB_STALL_TIMEOUT_SECONDS = max(180, int(os.getenv("UPLOAD_JOB_STALL_TIMEOUT_SECONDS", "480")))
 UPLOAD_QUEUE_STALL_TIMEOUT_SECONDS = max(0, int(os.getenv("UPLOAD_QUEUE_STALL_TIMEOUT_SECONDS", "0")))
 UPLOAD_JOB_LONG_POLL_MAX_WAIT_SECONDS = max(
@@ -195,7 +210,13 @@ DOCUMENT_UPLOAD_ONTOLOGY_JOB_ENABLED = _env_bool("DOCUMENT_UPLOAD_ONTOLOGY_JOB_E
 DOCUMENT_UPLOAD_ONTOLOGY_LLM_JOB_ENABLED = _env_bool("DOCUMENT_UPLOAD_ONTOLOGY_LLM_JOB_ENABLED", False)
 REPORTED_ANSWER_ONTOLOGY_RECHECK_ENABLED = _env_bool("REPORTED_ANSWER_ONTOLOGY_RECHECK_ENABLED", True)
 ONTOLOGY_REPORTED_MAX_CHUNKS = max(1, min(8, int(os.getenv("ONTOLOGY_REPORTED_MAX_CHUNKS", "8"))))
-_UPLOAD_OCR_PROGRESS_STAGES = {"load_pdf_ocr_model", "run_pdf_ocr", "fallback_pdf_ocr"}
+_UPLOAD_OCR_PROGRESS_STAGES = {
+    "load_pdf_ocr_model",
+    "run_pdf_ocr",
+    "fallback_pdf_ocr",
+    "merge_pdf_ocr",
+    "release_pdf_ocr_worker",
+}
 RAG_ENGINE_MAX_LOADED_KBS = max(1, int(os.getenv("RAG_ENGINE_MAX_LOADED_KBS", "1")))
 RAG_ENGINE_IDLE_TTL_SECONDS = max(60, int(os.getenv("RAG_ENGINE_IDLE_TTL_SECONDS", "900")))
 UPLOAD_CHUNK_BYTES = 1024 * 1024
@@ -751,6 +772,35 @@ def _is_grounded_abstention(text: str) -> bool:
     return is_grounded_abstention_text(text)
 
 
+def _contains_outside_document_claim(text: str) -> bool:
+    compact = _compact_text(text)
+    outside_markers = (
+        "문서밖참고",
+        "문서밖정보",
+        "문서밖",
+        "외부지식",
+        "관련기관에문의",
+        "기관에문의",
+    )
+    return any(marker in compact for marker in outside_markers)
+
+
+def _sanitize_outside_document_claims(answer_text: str) -> str:
+    raw = canonicalize_doc_citations(answer_text or "").strip()
+    if not raw or not _contains_outside_document_claim(raw):
+        return raw
+    kept_blocks: List[str] = []
+    for block in re.split(r"\n{2,}", raw):
+        cleaned = block.strip()
+        if not cleaned:
+            continue
+        if _contains_outside_document_claim(cleaned):
+            continue
+        kept_blocks.append(cleaned)
+    sanitized = "\n\n".join(kept_blocks).strip()
+    return sanitized or raw
+
+
 def _query_requires_code_hint(query: str) -> bool:
     compact = _compact_text(query)
     return any(h in compact for h in CODE_QUERY_HINTS)
@@ -766,9 +816,10 @@ def _is_question_echo_answer(query: str, answer_line: str) -> bool:
     if not q or not a:
         return False
     if a.startswith(q):
-        return True
+        tail = a[len(q) :].strip(" .。!?？！:：-–—")
+        return len(tail) <= 8
     if len(q) >= 14 and q[: min(40, len(q))] in a[: max(60, min(len(a), len(q) + 20))]:
-        return True
+        return len(a) <= len(q) + 12
 
     q_tokens = {t for t in _normalize_tokens(q) if len(t) >= 2 and t not in GROUNDING_STOP_TOKENS}
     a_tokens = {t for t in _normalize_tokens(a) if len(t) >= 2 and t not in GROUNDING_STOP_TOKENS}
@@ -785,6 +836,9 @@ def _response_quality_issue(query: str, response_text: str, metrics: Dict[str, A
     raw = canonicalize_doc_citations((response_text or "").strip())
     if not raw:
         return "empty"
+
+    if _contains_outside_document_claim(raw):
+        return "outside_document_claim"
 
     if _is_grounded_abstention(raw):
         if should_treat_abstention_as_quality_issue(query, metrics):
@@ -814,6 +868,8 @@ def _quality_retry_hint(issue: str) -> str:
         return "질문이 코드/부호/분류를 묻는다. 문서에 있는 코드(숫자)를 반드시 포함해라."
     if issue == "abstained_with_evidence":
         return "CONTEXT에 근거가 있다. 근거 부족으로 회피하지 말고 확인 가능한 범위를 답해라."
+    if issue == "outside_document_claim":
+        return "문서 밖 참고 정보, 일반적 조언, 기관 문의 같은 외부 추정을 빼고 현재 문서에서 확인되는 사실과 확인되지 않는 부분만 답해라."
     if issue == "empty":
         return "응답이 비었다. 한국어로 결론과 근거를 다시 작성해라."
     return "근거 연결과 답변 품질을 개선해 다시 작성해라."
@@ -1600,6 +1656,7 @@ rag_registry = KBEngineRegistry(
 upload_jobs: Dict[str, Dict[str, Any]] = {}
 upload_jobs_lock = threading.Lock()
 upload_jobs_condition = threading.Condition(upload_jobs_lock)
+_upload_job_store_last_prune_at = 0
 ocr_jobs: Dict[str, Dict[str, Any]] = {}
 ocr_jobs_lock = threading.Lock()
 ocr_jobs_condition = threading.Condition(ocr_jobs_lock)
@@ -1676,7 +1733,11 @@ def _load_agent_message_history(session_id: str, kb_name: str, *, user_id: str =
 
 
 def _build_compact_history_block(session_id: str, kb_name: str, *, user_id: str = "") -> str:
-    rows = _get_chat_history(session_id, kb_name, user_id=user_id)
+    rows = [
+        row
+        for row in _get_chat_history(session_id, kb_name, user_id=user_id)
+        if not (str(row.get("role", "")).lower() == "assistant" and is_failed_history_answer_text(str(row.get("text", ""))))
+    ]
     return compact_chat_history_rows(
         rows,
         turn_limit=ai_service.settings.compact_history_turn_limit,
@@ -1783,6 +1844,16 @@ def _resolve_user_kb(user: Dict[str, Any], display_name: str, *, create_if_missi
     return record
 
 
+def _public_kb_record(row: Mapping[str, Any]) -> Dict[str, Any]:
+    display_name = str(row.get("display_name", "") or "")
+    return {
+        "name": display_name,
+        "display_name": display_name,
+        "kb_id": str(row.get("kb_id", "") or ""),
+        "internal_kb_id": str(row.get("internal_kb_id", "") or display_name),
+    }
+
+
 def _truncate_text(text: Any, max_chars: int) -> str:
     value = str(text or "").strip()
     if max_chars <= 0 or len(value) <= max_chars:
@@ -1804,6 +1875,11 @@ def _append_admin_feedback_log(entry: Dict[str, Any]):
     ADMIN_FEEDBACK_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(entry, ensure_ascii=False)
     with admin_feedback_log_lock:
+        rotate_file_if_oversize(
+            ADMIN_FEEDBACK_LOG_PATH,
+            max_bytes=OPERATIONAL_JSONL_MAX_BYTES,
+            backup_count=OPERATIONAL_JSONL_BACKUP_COUNT,
+        )
         with ADMIN_FEEDBACK_LOG_PATH.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
 
@@ -1814,6 +1890,11 @@ def _append_rag_trace_log(entry: Dict[str, Any]):
     RAG_TRACE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(entry, ensure_ascii=False)
     with rag_trace_log_lock:
+        rotate_file_if_oversize(
+            RAG_TRACE_LOG_PATH,
+            max_bytes=OPERATIONAL_JSONL_MAX_BYTES,
+            backup_count=OPERATIONAL_JSONL_BACKUP_COUNT,
+        )
         with RAG_TRACE_LOG_PATH.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
 
@@ -2124,6 +2205,7 @@ def _is_hwpx_signature(path: str) -> bool:
 
 
 def _cleanup_upload_jobs_locked(now_ts: Optional[int] = None):
+    global _upload_job_store_last_prune_at
     now = int(now_ts or time.time())
     _coerce_stalled_upload_jobs_locked(now)
     expire_before = now - UPLOAD_JOB_RETENTION_SECONDS
@@ -2135,6 +2217,16 @@ def _cleanup_upload_jobs_locked(now_ts: Optional[int] = None):
             remove_ids.append(job_id)
     for job_id in remove_ids:
         upload_jobs.pop(job_id, None)
+    if now - int(_upload_job_store_last_prune_at or 0) >= UPLOAD_JOB_PRUNE_INTERVAL_SECONDS:
+        try:
+            upload_job_store.prune_terminal_jobs(
+                expire_before=expire_before,
+                max_terminal_rows=UPLOAD_JOB_RETENTION_MAX_ROWS,
+                batch_size=UPLOAD_JOB_PRUNE_BATCH_SIZE,
+            )
+            _upload_job_store_last_prune_at = now
+        except Exception as exc:
+            print(f"[UPLOAD][WARN] persisted_job_prune_failed error={exc}", file=sys.stderr)
 
 
 def _coerce_stalled_upload_jobs_locked(now_ts: Optional[int] = None):
@@ -2156,7 +2248,13 @@ def _coerce_stalled_upload_jobs_locked(now_ts: Optional[int] = None):
         job["message"] = stalled["message"]
         job["stall_seconds"] = int(stalled.get("stall_seconds", 0) or 0)
         job["stall_timeout_seconds"] = int(stalled.get("stall_timeout_seconds", 0) or 0)
+        job["stalled_stage"] = str(stalled.get("stalled_stage", "") or "").strip().lower()
         job["ocr_stall_detected"] = bool(stalled.get("ocr_stall_detected", False))
+        job["phase_elapsed_seconds"] = int(stalled.get("phase_elapsed_seconds", 0) or 0)
+        job["phase_last_heartbeat_at"] = int(stalled.get("phase_last_heartbeat_at", 0) or 0)
+        for key in ("pages_done", "pages_total", "rows_done", "rows_total", "chunks_done", "chunks_total"):
+            if key in stalled:
+                job[key] = int(stalled.get(key, 0) or 0)
         job["updated_at"] = now
         if not int(job.get("completed_at", 0) or 0):
             job["completed_at"] = now
@@ -2187,6 +2285,18 @@ def _extract_progress_page_stats(message: str) -> Dict[str, int]:
     }
 
 
+def _upload_job_int_tuple(value: Any) -> tuple[int, ...]:
+    result: List[int] = []
+    for item in list(value or []):
+        try:
+            parsed = int(item)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            result.append(parsed)
+    return tuple(sorted(set(result)))
+
+
 def _upload_job_public_version_snapshot(job: Dict[str, Any]) -> tuple[Any, ...]:
     return (
         str(job.get("status", "") or "").strip().lower(),
@@ -2214,11 +2324,48 @@ def _upload_job_public_version_snapshot(job: Dict[str, Any]) -> tuple[Any, ...]:
         float(job.get("ocr_elapsed_seconds", 0.0) or 0.0),
         int(job.get("ocr_pages_processed", 0) or 0),
         float(job.get("ocr_pages_per_minute", 0.0) or 0.0),
+        int(job.get("ocr_pages_attempted", 0) or 0),
+        int(job.get("ocr_pages_emitted", 0) or 0),
+        int(job.get("ocr_pages_skipped_empty", 0) or 0),
+        int(job.get("ocr_pages_skipped_short_text", 0) or 0),
+        float(job.get("ocr_attempted_pages_per_minute", 0.0) or 0.0),
+        float(job.get("ocr_emitted_pages_per_minute", 0.0) or 0.0),
+        bool(job.get("ocr_worker_released", False)),
+        float(job.get("ocr_worker_release_seconds", 0.0) or 0.0),
+        _upload_job_int_tuple(job.get("ocr_worker_pids", [])),
+        bool(job.get("ocr_worker_shutdown_confirmed", True)),
+        _upload_job_int_tuple(job.get("ocr_worker_alive_after_shutdown", [])),
         float(job.get("ocr_duration_seconds", 0.0) or 0.0),
         float(job.get("persist_duration_seconds", 0.0) or 0.0),
         float(job.get("embedding_duration_seconds", 0.0) or 0.0),
         float(job.get("index_duration_seconds", 0.0) or 0.0),
         float(job.get("derived_sync_duration_seconds", 0.0) or 0.0),
+        int(job.get("phase_started_at", 0) or 0),
+        int(job.get("phase_last_heartbeat_at", 0) or 0),
+        int(job.get("phase_elapsed_seconds", 0) or 0),
+        str(job.get("phase_name_effective", "") or "").strip().lower(),
+        int(job.get("phase_rows_total", 0) or 0),
+        int(job.get("phase_rows_done", 0) or 0),
+        int(job.get("phase_chunks_total", 0) or 0),
+        int(job.get("phase_chunks_done", 0) or 0),
+        int(job.get("embed_batch", 0) or 0),
+        int(job.get("embed_batches", 0) or 0),
+        int(job.get("embed_rows_done", 0) or 0),
+        int(job.get("embed_rows_total", 0) or 0),
+        int(job.get("embed_input_tokens_total", 0) or 0),
+        int(job.get("embed_input_tokens_done", 0) or 0),
+        int(job.get("embed_input_tokens_p95", 0) or 0),
+        int(job.get("embed_input_tokens_max", 0) or 0),
+        int(job.get("embed_truncated_rows", 0) or 0),
+        int(job.get("embed_effective_batch_tokens", 0) or 0),
+        int(job.get("ocr_fast_pages", 0) or 0),
+        int(job.get("ocr_vl_pages", 0) or 0),
+        float(job.get("ocr_fast_seconds", 0.0) or 0.0),
+        float(job.get("ocr_vl_seconds", 0.0) or 0.0),
+        float(job.get("ocr_fast_avg_score", 0.0) or 0.0),
+        float(job.get("ocr_fast_pair_ratio", 0.0) or 0.0),
+        float(job.get("ocr_fast_orphan_ratio", 0.0) or 0.0),
+        bool(job.get("ocr_high_quality_requested", False)),
         int(job.get("ocr_target_pages_goal", 0) or 0),
         float(job.get("ocr_target_seconds", 0.0) or 0.0),
         bool(job.get("ocr_target_met", False)),
@@ -2313,23 +2460,63 @@ def _create_upload_job(
         "ocr_elapsed_seconds": 0.0,
         "ocr_pages_processed": 0,
         "ocr_pages_per_minute": 0.0,
+        "ocr_pages_attempted": 0,
+        "ocr_pages_emitted": 0,
+        "ocr_pages_skipped_empty": 0,
+        "ocr_pages_skipped_short_text": 0,
+        "ocr_attempted_pages_per_minute": 0.0,
+        "ocr_emitted_pages_per_minute": 0.0,
+        "ocr_worker_released": False,
+        "ocr_worker_release_seconds": 0.0,
+        "ocr_worker_pids": [],
+        "ocr_worker_shutdown_confirmed": True,
+        "ocr_worker_alive_after_shutdown": [],
         "ocr_duration_seconds": 0.0,
         "persist_duration_seconds": 0.0,
         "embedding_duration_seconds": 0.0,
         "index_duration_seconds": 0.0,
         "derived_sync_duration_seconds": 0.0,
+        "phase_started_at": 0,
+        "phase_last_heartbeat_at": 0,
+        "phase_elapsed_seconds": 0,
+        "phase_name_effective": "",
+        "phase_rows_total": 0,
+        "phase_rows_done": 0,
+        "phase_chunks_total": 0,
+        "phase_chunks_done": 0,
+        "embed_batch": 0,
+        "embed_batches": 0,
+        "embed_rows_done": 0,
+        "embed_rows_total": 0,
+        "embed_input_tokens_total": 0,
+        "embed_input_tokens_done": 0,
+        "embed_input_tokens_p95": 0,
+        "embed_input_tokens_max": 0,
+        "embed_truncated_rows": 0,
+        "embed_effective_batch_tokens": 0,
         "ocr_subset_build_seconds": 0.0,
         "ocr_model_load_seconds": 0.0,
         "ocr_predict_seconds": 0.0,
         "ocr_output_materialize_seconds": 0.0,
         "ocr_payload_convert_seconds": 0.0,
+        "ocr_fragment_collect_seconds": 0.0,
+        "ocr_page_dedupe_seconds": 0.0,
+        "ocr_page_join_seconds": 0.0,
         "ocr_text_merge_seconds": 0.0,
         "ocr_merge_seconds": 0.0,
         "ocr_batch_count": 0,
-        "ocr_backend": (os.getenv("PDF_OCR_BACKEND", "local") or "local").strip(),
-        "ocr_backend_attempted": (os.getenv("PDF_OCR_BACKEND", "local") or "local").strip(),
-        "ocr_backend_effective": (os.getenv("PDF_OCR_BACKEND", "local") or "local").strip(),
+        "ocr_backend": (os.getenv("PDF_OCR_BACKEND", "ppocr_fast_v1") or "ppocr_fast_v1").strip(),
+        "ocr_backend_attempted": (os.getenv("PDF_OCR_BACKEND", "ppocr_fast_v1") or "ppocr_fast_v1").strip(),
+        "ocr_backend_effective": (os.getenv("PDF_OCR_BACKEND", "ppocr_fast_v1") or "ppocr_fast_v1").strip(),
         "ocr_backend_fallback_used": False,
+        "ocr_fast_pages": 0,
+        "ocr_vl_pages": 0,
+        "ocr_fast_seconds": 0.0,
+        "ocr_vl_seconds": 0.0,
+        "ocr_fast_avg_score": 0.0,
+        "ocr_fast_pair_ratio": 0.0,
+        "ocr_fast_orphan_ratio": 0.0,
+        "ocr_high_quality_requested": False,
         "ocr_target_pages_goal": int(os.getenv("PDF_OCR_TARGET_PAGES", os.getenv("PDF_OCR_MAX_PAGES", "200")) or 0),
         "ocr_target_seconds": float(os.getenv("PDF_OCR_TARGET_SECONDS", "300") or 0),
         "ocr_target_met": False,
@@ -2337,6 +2524,7 @@ def _create_upload_job(
         "ocr_retry_mode": "",
         "ocr_retry_reason": "",
         "ocr_stall_detected": False,
+        "stalled_stage": "",
         "ocr_heartbeat_at": 0,
         "failure_code": "",
         "queued_at": now,
@@ -2416,6 +2604,14 @@ def _get_upload_job(job_id: str) -> Optional[Dict[str, Any]]:
     ocr_last_batch_completed_at = int(payload.get("ocr_last_batch_completed_at", 0) or 0)
     payload["ocr_last_batch_age_seconds"] = (
         max(0, now - ocr_last_batch_completed_at) if ocr_last_batch_completed_at else 0
+    )
+    phase_started_at = int(payload.get("phase_started_at", 0) or 0)
+    payload["phase_elapsed_seconds"] = max(0, now - phase_started_at) if phase_started_at else int(
+        payload.get("phase_elapsed_seconds", 0) or 0
+    )
+    phase_last_heartbeat_at = int(payload.get("phase_last_heartbeat_at", 0) or 0)
+    payload["phase_last_heartbeat_age_seconds"] = (
+        max(0, now - phase_last_heartbeat_at) if phase_last_heartbeat_at else 0
     )
     payload["raw_progress_percent"] = int(payload.get("progress_percent", 0) or 0)
     payload["progress_percent"] = estimate_display_progress_percent(payload, now_ts=now)
@@ -2910,8 +3106,10 @@ def _run_ontology_rebuild_job(task: Dict[str, Any]):
         message="Ontology rebuild 대상 chunk를 확인하는 중입니다.",
         progress_percent=2,
     )
+    lease_context = None
     try:
-        rag = get_rag(internal_kb_id) or create_rag(internal_kb_id)
+        lease_context = rag_registry.lease(internal_kb_id, _create_rag_engine)
+        rag = lease_context.__enter__()
         conn = rag._connect_db()
         if requested_chunk_ids:
             placeholders = ",".join("?" for _ in requested_chunk_ids)
@@ -3005,6 +3203,9 @@ def _run_ontology_rebuild_job(task: Dict[str, Any]):
             message=str(exc),
             failure_code=failure_code,
         )
+    finally:
+        if lease_context is not None:
+            lease_context.__exit__(None, None, None)
 
 
 def _enqueue_document_upload_ontology_job(
@@ -3133,6 +3334,7 @@ def _ingest_upload_job(task: Dict[str, Any]):
     original_filename = task.get("original_filename", "")
     stored_filename = task.get("stored_filename", "")
     document_role = _normalize_doc_role(str(task.get("document_role", "")))
+    pdf_ocr_mode = str(task.get("pdf_ocr_mode", "") or "").strip().lower().replace("-", "_")
     progress_state = {
         "percent": 0,
         "last_ocr_log_key": None,
@@ -3156,6 +3358,7 @@ def _ingest_upload_job(task: Dict[str, Any]):
                 progress_state,
                 stage or "processing",
                 now_ts=int(time.time()),
+                progress_meta=extra_progress_updates,
             )
         )
         progress_updates = _extract_progress_page_stats(message)
@@ -3173,6 +3376,24 @@ def _ingest_upload_job(task: Dict[str, Any]):
             index_completed=bool(progress_state["index_completed"]),
             embedding_started_at=int(progress_state["embedding_started_at"] or 0),
             embedding_completed_at=int(progress_state["embedding_completed_at"] or 0),
+            phase_started_at=int(progress_state.get("phase_started_at", 0) or 0),
+            phase_last_heartbeat_at=int(progress_state.get("phase_last_heartbeat_at", 0) or 0),
+            phase_elapsed_seconds=int(progress_state.get("phase_elapsed_seconds", 0) or 0),
+            phase_name_effective=str(progress_state.get("phase_name_effective", "") or ""),
+            phase_rows_total=int(progress_state.get("phase_rows_total", 0) or 0),
+            phase_rows_done=int(progress_state.get("phase_rows_done", 0) or 0),
+            phase_chunks_total=int(progress_state.get("phase_chunks_total", 0) or 0),
+            phase_chunks_done=int(progress_state.get("phase_chunks_done", 0) or 0),
+            embed_batch=int(progress_state.get("embed_batch", 0) or 0),
+            embed_batches=int(progress_state.get("embed_batches", 0) or 0),
+            embed_rows_done=int(progress_state.get("embed_rows_done", 0) or 0),
+            embed_rows_total=int(progress_state.get("embed_rows_total", 0) or 0),
+            embed_input_tokens_total=int(progress_state.get("embed_input_tokens_total", 0) or 0),
+            embed_input_tokens_done=int(progress_state.get("embed_input_tokens_done", 0) or 0),
+            embed_input_tokens_p95=int(progress_state.get("embed_input_tokens_p95", 0) or 0),
+            embed_input_tokens_max=int(progress_state.get("embed_input_tokens_max", 0) or 0),
+            embed_truncated_rows=int(progress_state.get("embed_truncated_rows", 0) or 0),
+            embed_effective_batch_tokens=int(progress_state.get("embed_effective_batch_tokens", 0) or 0),
             **progress_updates,
         )
         if (stage or "").strip().lower() in {"load_pdf_ocr_model", "run_pdf_ocr", "fallback_pdf_ocr", "merge_pdf_ocr"}:
@@ -3199,16 +3420,14 @@ def _ingest_upload_job(task: Dict[str, Any]):
 
     try:
         update_progress(10, "지식베이스를 준비하는 중입니다.", "prepare_kb")
-        rag = get_rag(kb_name)
-        if not rag:
-            rag = create_rag(kb_name)
-
-        ingest_result = rag.ingest_file(
-            stored_path,
-            original_filename=original_filename,
-            document_role=document_role,
-            progress_callback=update_progress,
-        )
+        with rag_registry.lease(kb_name, _create_rag_engine) as rag:
+            ingest_result = rag.ingest_file(
+                stored_path,
+                original_filename=original_filename,
+                document_role=document_role,
+                progress_callback=update_progress,
+                pdf_ocr_mode=pdf_ocr_mode,
+            )
         used_cache = bool((ingest_result or {}).get("used_cache", False))
         chunks = int((ingest_result or {}).get("chunks", 0))
         replaced = int((ingest_result or {}).get("replaced_chunks", 0))
@@ -3258,6 +3477,17 @@ def _ingest_upload_job(task: Dict[str, Any]):
             ocr_elapsed_seconds=float((ingest_result or {}).get("ocr_elapsed_seconds", 0.0) or 0.0),
             ocr_pages_processed=int((ingest_result or {}).get("ocr_pages_processed", 0) or 0),
             ocr_pages_per_minute=float((ingest_result or {}).get("ocr_pages_per_minute", 0.0) or 0.0),
+            ocr_pages_attempted=int((ingest_result or {}).get("ocr_pages_attempted", 0) or 0),
+            ocr_pages_emitted=int((ingest_result or {}).get("ocr_pages_emitted", 0) or 0),
+            ocr_pages_skipped_empty=int((ingest_result or {}).get("ocr_pages_skipped_empty", 0) or 0),
+            ocr_pages_skipped_short_text=int((ingest_result or {}).get("ocr_pages_skipped_short_text", 0) or 0),
+            ocr_attempted_pages_per_minute=float((ingest_result or {}).get("ocr_attempted_pages_per_minute", 0.0) or 0.0),
+            ocr_emitted_pages_per_minute=float((ingest_result or {}).get("ocr_emitted_pages_per_minute", 0.0) or 0.0),
+            ocr_worker_released=bool((ingest_result or {}).get("ocr_worker_released", False)),
+            ocr_worker_release_seconds=float((ingest_result or {}).get("ocr_worker_release_seconds", 0.0) or 0.0),
+            ocr_worker_pids=list((ingest_result or {}).get("ocr_worker_pids", []) or []),
+            ocr_worker_shutdown_confirmed=bool((ingest_result or {}).get("ocr_worker_shutdown_confirmed", True)),
+            ocr_worker_alive_after_shutdown=list((ingest_result or {}).get("ocr_worker_alive_after_shutdown", []) or []),
             ocr_duration_seconds=float((ingest_result or {}).get("ocr_duration_seconds", 0.0) or 0.0),
             persist_duration_seconds=float((ingest_result or {}).get("persist_duration_seconds", 0.0) or 0.0),
             embedding_duration_seconds=float((ingest_result or {}).get("embedding_duration_seconds", 0.0) or 0.0),
@@ -3270,6 +3500,9 @@ def _ingest_upload_job(task: Dict[str, Any]):
             ocr_predict_seconds=float((ingest_result or {}).get("ocr_predict_seconds", 0.0) or 0.0),
             ocr_output_materialize_seconds=float((ingest_result or {}).get("ocr_output_materialize_seconds", 0.0) or 0.0),
             ocr_payload_convert_seconds=float((ingest_result or {}).get("ocr_payload_convert_seconds", 0.0) or 0.0),
+            ocr_fragment_collect_seconds=float((ingest_result or {}).get("ocr_fragment_collect_seconds", 0.0) or 0.0),
+            ocr_page_dedupe_seconds=float((ingest_result or {}).get("ocr_page_dedupe_seconds", 0.0) or 0.0),
+            ocr_page_join_seconds=float((ingest_result or {}).get("ocr_page_join_seconds", 0.0) or 0.0),
             ocr_text_merge_seconds=float((ingest_result or {}).get("ocr_text_merge_seconds", 0.0) or 0.0),
             ocr_merge_seconds=float((ingest_result or {}).get("ocr_merge_seconds", 0.0) or 0.0),
             ocr_batch_count=int((ingest_result or {}).get("ocr_batch_count", 0) or 0),
@@ -3277,6 +3510,14 @@ def _ingest_upload_job(task: Dict[str, Any]):
             ocr_backend_attempted=str((ingest_result or {}).get("ocr_backend_attempted", "") or "").strip(),
             ocr_backend_effective=str((ingest_result or {}).get("ocr_backend_effective", "") or "").strip(),
             ocr_backend_fallback_used=bool((ingest_result or {}).get("ocr_backend_fallback_used", False)),
+            ocr_fast_pages=int((ingest_result or {}).get("ocr_fast_pages", 0) or 0),
+            ocr_vl_pages=int((ingest_result or {}).get("ocr_vl_pages", 0) or 0),
+            ocr_fast_seconds=float((ingest_result or {}).get("ocr_fast_seconds", 0.0) or 0.0),
+            ocr_vl_seconds=float((ingest_result or {}).get("ocr_vl_seconds", 0.0) or 0.0),
+            ocr_fast_avg_score=float((ingest_result or {}).get("ocr_fast_avg_score", 0.0) or 0.0),
+            ocr_fast_pair_ratio=float((ingest_result or {}).get("ocr_fast_pair_ratio", 0.0) or 0.0),
+            ocr_fast_orphan_ratio=float((ingest_result or {}).get("ocr_fast_orphan_ratio", 0.0) or 0.0),
+            ocr_high_quality_requested=bool((ingest_result or {}).get("ocr_high_quality_requested", False)),
             ocr_target_pages_goal=int((ingest_result or {}).get("ocr_target_pages", 0) or 0),
             ocr_target_seconds=float((ingest_result or {}).get("ocr_target_seconds", 0.0) or 0.0),
             ocr_target_met=bool((ingest_result or {}).get("ocr_target_met", False)),
@@ -3326,6 +3567,17 @@ def _ingest_upload_job(task: Dict[str, Any]):
             ocr_elapsed_seconds=float(runtime_info.get("ocr_elapsed_seconds", 0.0) or 0.0),
             ocr_pages_processed=int(runtime_info.get("ocr_pages_processed", 0) or 0),
             ocr_pages_per_minute=float(runtime_info.get("ocr_pages_per_minute", 0.0) or 0.0),
+            ocr_pages_attempted=int(runtime_info.get("ocr_pages_attempted", 0) or 0),
+            ocr_pages_emitted=int(runtime_info.get("ocr_pages_emitted", 0) or 0),
+            ocr_pages_skipped_empty=int(runtime_info.get("ocr_pages_skipped_empty", 0) or 0),
+            ocr_pages_skipped_short_text=int(runtime_info.get("ocr_pages_skipped_short_text", 0) or 0),
+            ocr_attempted_pages_per_minute=float(runtime_info.get("ocr_attempted_pages_per_minute", 0.0) or 0.0),
+            ocr_emitted_pages_per_minute=float(runtime_info.get("ocr_emitted_pages_per_minute", 0.0) or 0.0),
+            ocr_worker_released=bool(runtime_info.get("ocr_worker_released", False)),
+            ocr_worker_release_seconds=float(runtime_info.get("ocr_worker_release_seconds", 0.0) or 0.0),
+            ocr_worker_pids=list(runtime_info.get("ocr_worker_pids", []) or []),
+            ocr_worker_shutdown_confirmed=bool(runtime_info.get("ocr_worker_shutdown_confirmed", True)),
+            ocr_worker_alive_after_shutdown=list(runtime_info.get("ocr_worker_alive_after_shutdown", []) or []),
             ocr_duration_seconds=float(runtime_info.get("ocr_duration_seconds", 0.0) or 0.0),
             persist_duration_seconds=float(runtime_info.get("persist_duration_seconds", 0.0) or 0.0),
             embedding_duration_seconds=float(runtime_info.get("embedding_duration_seconds", 0.0) or 0.0),
@@ -3336,6 +3588,9 @@ def _ingest_upload_job(task: Dict[str, Any]):
             ocr_predict_seconds=float(runtime_info.get("ocr_predict_seconds", 0.0) or 0.0),
             ocr_output_materialize_seconds=float(runtime_info.get("ocr_output_materialize_seconds", 0.0) or 0.0),
             ocr_payload_convert_seconds=float(runtime_info.get("ocr_payload_convert_seconds", 0.0) or 0.0),
+            ocr_fragment_collect_seconds=float(runtime_info.get("ocr_fragment_collect_seconds", 0.0) or 0.0),
+            ocr_page_dedupe_seconds=float(runtime_info.get("ocr_page_dedupe_seconds", 0.0) or 0.0),
+            ocr_page_join_seconds=float(runtime_info.get("ocr_page_join_seconds", 0.0) or 0.0),
             ocr_text_merge_seconds=float(runtime_info.get("ocr_text_merge_seconds", 0.0) or 0.0),
             ocr_merge_seconds=float(runtime_info.get("ocr_merge_seconds", 0.0) or 0.0),
             ocr_batch_count=int(runtime_info.get("ocr_batch_count", 0) or 0),
@@ -3343,6 +3598,14 @@ def _ingest_upload_job(task: Dict[str, Any]):
             ocr_backend_attempted=str(runtime_info.get("ocr_backend_attempted", "") or "").strip(),
             ocr_backend_effective=str(runtime_info.get("ocr_backend_effective", "") or "").strip(),
             ocr_backend_fallback_used=bool(runtime_info.get("ocr_backend_fallback_used", False)),
+            ocr_fast_pages=int(runtime_info.get("ocr_fast_pages", 0) or 0),
+            ocr_vl_pages=int(runtime_info.get("ocr_vl_pages", 0) or 0),
+            ocr_fast_seconds=float(runtime_info.get("ocr_fast_seconds", 0.0) or 0.0),
+            ocr_vl_seconds=float(runtime_info.get("ocr_vl_seconds", 0.0) or 0.0),
+            ocr_fast_avg_score=float(runtime_info.get("ocr_fast_avg_score", 0.0) or 0.0),
+            ocr_fast_pair_ratio=float(runtime_info.get("ocr_fast_pair_ratio", 0.0) or 0.0),
+            ocr_fast_orphan_ratio=float(runtime_info.get("ocr_fast_orphan_ratio", 0.0) or 0.0),
+            ocr_high_quality_requested=bool(runtime_info.get("ocr_high_quality_requested", False)),
             ocr_target_pages_goal=int(runtime_info.get("ocr_target_pages", 0) or 0),
             ocr_target_seconds=float(runtime_info.get("ocr_target_seconds", 0.0) or 0.0),
             ocr_target_met=bool(runtime_info.get("ocr_target_met", False)),
@@ -3388,16 +3651,14 @@ def _run_background_ocr_job(task: Dict[str, Any]):
         return
     update_progress(5, "OCR 보강을 준비하는 중입니다.", "preparing")
     try:
-        rag = get_rag(kb_name)
-        if not rag:
-            rag = create_rag(kb_name)
-        result = rag.ingest_file(
-            stored_path,
-            original_filename=original_filename,
-            document_role=document_role,
-            progress_callback=update_progress,
-            force_pdf_ocr=True,
-        )
+        with rag_registry.lease(kb_name, _create_rag_engine) as rag:
+            result = rag.ingest_file(
+                stored_path,
+                original_filename=original_filename,
+                document_role=document_role,
+                progress_callback=update_progress,
+                force_pdf_ocr=True,
+            )
         status = str((result or {}).get("status", "") or "").strip().lower()
         if status == "empty":
             _update_ocr_job(
@@ -3652,6 +3913,10 @@ def _ensure_upload_workers():
             ontology_rebuild_workers.append(t)
         upload_workers_started = True
 
+def _create_rag_engine(kb_id: str) -> RAGEngine:
+    return RAGEngine(kb_id=kb_id, data_dir=str(KB_DATA_DIR))
+
+
 def get_rag(kb_id: str) -> Optional[RAGEngine]:
     """Get or load RAG engine for a specific KB."""
     existing = rag_registry.get(kb_id)
@@ -3663,7 +3928,7 @@ def get_rag(kb_id: str) -> Optional[RAGEngine]:
             print(f"Loading RAG for {kb_id}...")
             return rag_registry.get_or_create(
                 kb_id,
-                lambda resolved_kb: RAGEngine(kb_id=resolved_kb, data_dir=str(KB_DATA_DIR)),
+                _create_rag_engine,
             )
         except Exception as e:
             failure_code = _classify_failure_code(e, default="rag_load_fail")
@@ -3677,7 +3942,7 @@ def create_rag(kb_id: str) -> RAGEngine:
         print(f"Creating RAG for {kb_id}...")
         return rag_registry.get_or_create(
             kb_id,
-            lambda resolved_kb: RAGEngine(kb_id=resolved_kb, data_dir=str(KB_DATA_DIR)),
+            _create_rag_engine,
         )
     except Exception as e:
         failure_code = _classify_failure_code(e, default="rag_create_fail")
@@ -3744,11 +4009,12 @@ def _warmup_pdf_ocr_worker_on_startup() -> None:
 
         info = warmup_persistent_ocr_worker(
             model_name=(os.getenv("PDF_OCR_MODEL_NAME", "") or "").strip() or None,
-            device=(os.getenv("PDF_OCR_DEVICE", "cpu") or "cpu").strip(),
         )
         print(
             "[PDF_OCR][WARMUP] "
             f"status={info.get('status', '')} "
+            f"backend={info.get('backend', '')} "
+            f"execution_scope={info.get('execution_scope', 'worker_process')} "
             f"device={info.get('device', '')} "
             f"worker_count={int(info.get('worker_count', 0) or 0)} "
             f"worker_pids={','.join(str(pid) for pid in list(info.get('worker_pids', []) or [])) or '-'} "
@@ -3761,6 +4027,10 @@ def _warmup_pdf_ocr_worker_on_startup() -> None:
 @app.on_event("startup")
 async def startup_event():
     _print_startup_config_summary()
+    try:
+        auth_store.prune_expired_sessions(limit=AUTH_SESSION_PRUNE_LIMIT)
+    except Exception as exc:
+        print(f"[AUTH][WARN] expired_session_prune_failed error={exc}", file=sys.stderr)
     _warmup_pdf_ocr_worker_on_startup()
     _ensure_upload_workers()
     _recover_persisted_upload_jobs_on_startup()
@@ -3787,6 +4057,7 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
+    print("[SHUTDOWN] service=backend status=begin", flush=True)
     upload_shutdown_event.set()
     ocr_shutdown_event.set()
     ontology_rebuild_shutdown_event.set()
@@ -3816,6 +4087,7 @@ async def shutdown_event():
             ontology_rebuild_queue.put_nowait(None)
         except queue.Full:
             break
+    print("[SHUTDOWN] service=backend status=complete", flush=True)
 
 @app.get("/", response_class=HTMLResponse)
 async def read_root(request: Request):
@@ -3957,7 +4229,11 @@ async def get_kbs_endpoint(request: Request):
     if not user:
         return _auth_required_response()
     _sync_legacy_kbs_for_admin_best_effort(user)
-    return {"kbs": [row["display_name"] for row in auth_store.list_kbs(str(user["user_id"]))]}
+    rows = auth_store.list_kbs(str(user["user_id"]))
+    return {
+        "kbs": [row["display_name"] for row in rows],
+        "kb_records": [_public_kb_record(row) for row in rows],
+    }
 
 
 @app.get("/chat/history")
@@ -5179,7 +5455,7 @@ async def delete_kb_endpoint(kb_name: str, request: Request):
         delete_kb_dir(internal_kb_id, data_dir=str(KB_DATA_DIR))
         auth_store.soft_delete_kb(str(user["user_id"]), kb_name)
         rag_registry.remove(internal_kb_id)
-        return {"status": "success"}
+        return {"status": "success", "name": kb_name, "internal_kb_id": internal_kb_id}
     except Exception as e:
         return _error_json_response(
             status_code=500,
@@ -5235,7 +5511,7 @@ async def rename_kb_endpoint(kb_name: str, request: Request):
                 message="지정한 공간을 찾지 못했습니다.",
                 failure_code="knowledge_base_not_found",
             )
-        return {"status": "success", "new_name": new_name}
+        return {"status": "success", "new_name": new_name, "kb_record": _public_kb_record(renamed_record)}
     except ValueError as e:
         message = str(e) or "공간 이름 변경 중 문제가 생겼습니다."
         if "already exists" in message:
@@ -5322,7 +5598,13 @@ async def create_kb_endpoint(request: Request):
         kb_record = auth_store.create_kb(str(user["user_id"]), kb_name)
         kb_dir = ensure_kb_directory(str(kb_record["internal_kb_id"]))
         kb_dir.mkdir(parents=True, exist_ok=True)
-        return {"status": "success", "name": kb_name}
+        return {
+            "status": "success",
+            "name": kb_name,
+            "kb_id": str(kb_record["kb_id"]),
+            "internal_kb_id": str(kb_record["internal_kb_id"]),
+            "kb_record": _public_kb_record(kb_record),
+        }
     except Exception as e:
         return _error_json_response(
             status_code=500,
@@ -5337,6 +5619,7 @@ async def upload_file(
     kb_name: str = Form("default"),
     document_role: str = Form(""),
     sync: str = Form(""),
+    pdf_ocr_mode: str = Form(""),
 ):
     """Handle file upload to a specific KB."""
     user = _require_current_user(request)
@@ -5426,6 +5709,17 @@ async def upload_file(
         )
 
     force_sync = str(sync or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+    normalized_pdf_ocr_mode = str(pdf_ocr_mode or "").strip().lower().replace("-", "_")
+    if normalized_pdf_ocr_mode not in {"", "fast", "high_quality", "highquality"}:
+        os.remove(stored_path)
+        return _error_json_response(
+            status_code=400,
+            message="pdf_ocr_mode must be fast or high_quality.",
+            failure_code="upload_validation_fail",
+            filename=original_name,
+        )
+    if normalized_pdf_ocr_mode == "highquality":
+        normalized_pdf_ocr_mode = "high_quality"
     run_async = UPLOAD_ASYNC_ENABLED and not force_sync
 
     if run_async:
@@ -5450,6 +5744,7 @@ async def upload_file(
             "saved_bytes": int(saved_bytes),
             "document_role": resolved_doc_role,
             "upload_lane": upload_lane,
+            "pdf_ocr_mode": normalized_pdf_ocr_mode,
         }
         try:
             selected_queue.put_nowait(task)
@@ -5475,26 +5770,17 @@ async def upload_file(
             "size_bytes": int(saved_bytes),
             "document_role": resolved_doc_role,
             "document_role_label": _doc_role_label(resolved_doc_role),
+            "pdf_ocr_mode": normalized_pdf_ocr_mode,
         }
 
-    rag = get_rag(internal_kb_id)
-    if not rag:
-        try:
-            rag = create_rag(internal_kb_id)
-        except Exception as e:
-            return _error_json_response(
-                status_code=500,
-                message=f"공간을 준비하지 못했습니다: {str(e)}",
-                failure_code=_classify_failure_code(e, default="kb_init_fail"),
-                filename=file.filename or "",
-            )
-
     try:
-        ingest_result = rag.ingest_file(
-            stored_path,
-            original_filename=original_name,
-            document_role=resolved_doc_role,
-        )
+        with rag_registry.lease(internal_kb_id, _create_rag_engine) as rag:
+            ingest_result = rag.ingest_file(
+                stored_path,
+                original_filename=original_name,
+                document_role=resolved_doc_role,
+                pdf_ocr_mode=normalized_pdf_ocr_mode,
+            )
         used_cache = bool((ingest_result or {}).get("used_cache", False))
         replaced = int((ingest_result or {}).get("replaced_chunks", 0))
         chunks = int((ingest_result or {}).get("chunks", 0))
@@ -5541,6 +5827,11 @@ async def upload_file(
             "size_bytes": int(saved_bytes),
             "document_role": resolved_doc_role,
             "document_role_label": _doc_role_label(resolved_doc_role),
+            "ocr_worker_released": bool((ingest_result or {}).get("ocr_worker_released", False)),
+            "ocr_worker_release_seconds": float((ingest_result or {}).get("ocr_worker_release_seconds", 0.0) or 0.0),
+            "ocr_worker_pids": list((ingest_result or {}).get("ocr_worker_pids", []) or []),
+            "ocr_worker_shutdown_confirmed": bool((ingest_result or {}).get("ocr_worker_shutdown_confirmed", True)),
+            "ocr_worker_alive_after_shutdown": list((ingest_result or {}).get("ocr_worker_alive_after_shutdown", []) or []),
             "ocr_duration_seconds": float((ingest_result or {}).get("ocr_duration_seconds", 0.0) or 0.0),
             "persist_duration_seconds": float((ingest_result or {}).get("persist_duration_seconds", 0.0) or 0.0),
             "embedding_duration_seconds": float((ingest_result or {}).get("embedding_duration_seconds", 0.0) or 0.0),
@@ -5548,6 +5839,22 @@ async def upload_file(
             "derived_sync_duration_seconds": float(
                 (ingest_result or {}).get("derived_sync_duration_seconds", 0.0) or 0.0
             ),
+            "ocr_pages_attempted": int((ingest_result or {}).get("ocr_pages_attempted", 0) or 0),
+            "ocr_pages_emitted": int((ingest_result or {}).get("ocr_pages_emitted", 0) or 0),
+            "ocr_pages_skipped_empty": int((ingest_result or {}).get("ocr_pages_skipped_empty", 0) or 0),
+            "ocr_pages_skipped_short_text": int((ingest_result or {}).get("ocr_pages_skipped_short_text", 0) or 0),
+            "ocr_backend": str((ingest_result or {}).get("ocr_backend", "") or "").strip(),
+            "ocr_backend_attempted": str((ingest_result or {}).get("ocr_backend_attempted", "") or "").strip(),
+            "ocr_backend_effective": str((ingest_result or {}).get("ocr_backend_effective", "") or "").strip(),
+            "ocr_backend_fallback_used": bool((ingest_result or {}).get("ocr_backend_fallback_used", False)),
+            "ocr_fast_pages": int((ingest_result or {}).get("ocr_fast_pages", 0) or 0),
+            "ocr_vl_pages": int((ingest_result or {}).get("ocr_vl_pages", 0) or 0),
+            "ocr_fast_seconds": float((ingest_result or {}).get("ocr_fast_seconds", 0.0) or 0.0),
+            "ocr_vl_seconds": float((ingest_result or {}).get("ocr_vl_seconds", 0.0) or 0.0),
+            "ocr_fast_avg_score": float((ingest_result or {}).get("ocr_fast_avg_score", 0.0) or 0.0),
+            "ocr_fast_pair_ratio": float((ingest_result or {}).get("ocr_fast_pair_ratio", 0.0) or 0.0),
+            "ocr_fast_orphan_ratio": float((ingest_result or {}).get("ocr_fast_orphan_ratio", 0.0) or 0.0),
+            "ocr_high_quality_requested": bool((ingest_result or {}).get("ocr_high_quality_requested", False)),
         }
     except Exception as e:
         return {
@@ -5746,9 +6053,24 @@ async def chat(request: Request):
         )
     kb_name = str(kb_record["internal_kb_id"])
     query_id = uuid.uuid4().hex
+    rag_lease_state: Dict[str, Any] = {
+        "context": None,
+        "transferred_to_response": False,
+    }
+
+    def _release_rag_lease() -> None:
+        lease_context = rag_lease_state.pop("context", None)
+        if lease_context is not None:
+            lease_context.__exit__(None, None, None)
 
     def _stream_response(text: str, headers: Optional[Dict[str, str]] = None):
         response = StreamingResponse(_single_chunk_stream(text), media_type="text/event-stream")
+        if (
+            rag_lease_state.get("context") is not None
+            and not bool(rag_lease_state.get("transferred_to_response", False))
+        ):
+            rag_lease_state["transferred_to_response"] = True
+            response.background = BackgroundTask(_release_rag_lease)
         response.headers["X-Query-Id"] = query_id
         for key, value in (headers or {}).items():
             if value:
@@ -5796,7 +6118,14 @@ async def chat(request: Request):
     kb_files = get_kb_files(kb_name, data_dir=str(KB_DATA_DIR))
     kb_has_docs = bool(kb_files)
     kb_file_count = len(kb_files)
-    history_rows = _get_chat_history(session_id, kb_name, user_id=user_id) if history_enabled else []
+    raw_history_rows = _get_chat_history(session_id, kb_name, user_id=user_id) if history_enabled else []
+    history_rows = [
+        row
+        for row in raw_history_rows
+        if not (str(row.get("role", "")).lower() == "assistant" and is_failed_history_answer_text(str(row.get("text", ""))))
+    ]
+    history_failed_turns_dropped = max(0, len(raw_history_rows) - len(history_rows))
+    compact_history_success_turns = sum(1 for row in history_rows if str(row.get("role", "")).lower() == "assistant")
     recent_mode_state = (
         summarize_recent_conversation_state(
             chat_store.get_recent_agent_runs(
@@ -6043,6 +6372,31 @@ async def chat(request: Request):
                 return validator
         return ""
 
+    def _validation_event_summary() -> Dict[str, Any]:
+        validator_counts: Dict[str, int] = {}
+        repair_validators = {"answer_format_repair", "citation_repair", "answer_sanitizer"}
+        retry_validators = {"citation", "tool_recheck", "numeric_recheck", "outline_recheck", "quality_checker"}
+        repair_applied = False
+        retry_counts: Dict[str, int] = {}
+        final_issue = ""
+        for event in run_state.phase_events:
+            if event.phase != "output_validation":
+                continue
+            payload = event.payload or {}
+            validator = str(payload.get("validator", "") or "").strip() or "unknown"
+            validator_counts[validator] = validator_counts.get(validator, 0) + 1
+            if validator in repair_validators:
+                repair_applied = True
+            if validator in retry_validators:
+                retry_counts[validator] = retry_counts.get(validator, 0) + 1
+                final_issue = str(event.detail or "").strip()
+        return {
+            "validator_counts": validator_counts,
+            "validator_retry_counts": retry_counts,
+            "validator_repair_applied": bool(repair_applied),
+            "final_validator_issue": final_issue,
+        }
+
     def _build_answer_log_metadata(
         *,
         response_quality_issue: str = "",
@@ -6055,6 +6409,7 @@ async def chat(request: Request):
         attempt_index: int = 0,
     ) -> Dict[str, Any]:
         evidence_summary = _doc_evidence_summary()
+        validation_summary = _validation_event_summary()
         return {
             "session_id": session_id,
             "kb_name": kb_name,
@@ -6089,6 +6444,8 @@ async def chat(request: Request):
             "number_refs": number_refs[:8],
             "overview_mode": bool(overview_mode),
             "history_enabled": bool(history_enabled),
+            "history_failed_turns_dropped": int(history_failed_turns_dropped),
+            "compact_history_success_turns": int(compact_history_success_turns),
             "conversation_mode": conversation_mode,
             "mode_resolution_reason": mode_resolution_reason,
             "mode_anchor_run_id": int(mode_anchor_run_id or 0),
@@ -6111,6 +6468,10 @@ async def chat(request: Request):
             "response_quality_issue": (response_quality_issue or "").strip(),
             "failure_code": (failure_code or "").strip(),
             "last_validator": _latest_output_validator_name(),
+            "validator_counts": validation_summary["validator_counts"],
+            "validator_retry_counts": validation_summary["validator_retry_counts"],
+            "validator_repair_applied": validation_summary["validator_repair_applied"],
+            "final_validator_issue": validation_summary["final_validator_issue"],
             "auto_prefetch_doc_count": len(last_auto_prefetch_doc_nos),
             "auto_prefetch_doc_nos": list(last_auto_prefetch_doc_nos[:4]),
             "weak_evidence_only": bool(evidence_summary.get("weak_evidence_only", False)),
@@ -6185,11 +6546,50 @@ async def chat(request: Request):
     def _doc_evidence_summary(records: Optional[List[RetrievedDocRecord]] = None) -> Dict[str, Any]:
         return dict(summarize_evidence_strength(_evidence_rows(records)))
 
+    def _seeded_evidence_sufficient_for_answer() -> bool:
+        if not rag or not run_state.docs:
+            return False
+        if overview_mode or question_analysis.use_source_outline or question_analysis.numeric_evidence_required:
+            return False
+        evidence_summary = _doc_evidence_summary()
+        metrics = run_state.latest_metrics or retrieval_metrics or {}
+        return (
+            int(evidence_summary.get("strong_evidence_count", 0) or 0) > 0
+            and float(metrics.get("coverage", 0.0) or 0.0) >= 0.6
+            and float(metrics.get("top1", 0.0) or 0.0) >= 0.5
+        )
+
     def _render_user_visible_answer(answer_text: str) -> str:
         raw_answer = (answer_text or "").strip()
         if not raw_answer or not run_state.docs:
             return raw_answer
         return render_answer_with_bottom_citations(raw_answer, run_state.docs)
+
+    def _repair_missing_answer_citations(answer_text: str) -> str:
+        raw_answer = canonicalize_doc_citations(answer_text or "").strip()
+        if not raw_answer or not run_state.docs:
+            return raw_answer
+        if _is_grounded_abstention(raw_answer) or DOC_LABEL_PATTERN.search(raw_answer):
+            return raw_answer
+        evidence_summary = _doc_evidence_summary()
+        if bool(evidence_summary.get("weak_evidence_only", False)):
+            return raw_answer
+        if int(evidence_summary.get("strong_evidence_count", 0) or 0) <= 0:
+            return raw_answer
+
+        preferred_doc_numbers: List[int] = []
+        for doc_no in list(last_auto_prefetch_doc_nos):
+            if doc_no in run_state.docs and doc_no not in preferred_doc_numbers:
+                preferred_doc_numbers.append(int(doc_no))
+        for doc_no in sorted(run_state.docs.keys()):
+            if doc_no not in preferred_doc_numbers:
+                preferred_doc_numbers.append(int(doc_no))
+            if len(preferred_doc_numbers) >= 2:
+                break
+        if not preferred_doc_numbers:
+            return raw_answer
+        citation_refs = ", ".join(f"[DOC {doc_no}]" for doc_no in preferred_doc_numbers[:2])
+        return f"{raw_answer}\n\n근거: {citation_refs}"
 
     def _append_phase_event(
         phase: str,
@@ -6459,7 +6859,12 @@ async def chat(request: Request):
             )
 
     if conversation_mode == "document_qa" and kb_has_docs and rag is None:
-        rag = get_rag(kb_name)
+        try:
+            lease_context = rag_registry.lease(kb_name, _create_rag_engine)
+            rag = lease_context.__enter__()
+            rag_lease_state["context"] = lease_context
+        except Exception:
+            rag = None
         if rag is None:
             _append_phase_event(
                 "rag_load",
@@ -7319,6 +7724,8 @@ async def chat(request: Request):
             "strategy": history_strategy,
             "message_history_count": len(agent_history),
             "compact_history_chars": len(compact_history_block),
+            "history_failed_turns_dropped": int(history_failed_turns_dropped),
+            "compact_history_success_turns": int(compact_history_success_turns),
         },
     )
     agent_instruction_token_budget = int(os.getenv("PYDANTIC_AI_PROMPT_BASE_TOKENS", "1100"))
@@ -7347,6 +7754,23 @@ async def chat(request: Request):
             "답변에 마크다운 제목, 불릿, 번호 목록, 굵게, 백틱을 쓰지 말고 일반 문장과 줄바꿈만 사용하라.",
             "강조가 필요하면 괄호나 대괄호만 사용하라.",
         ]
+        lines.extend(
+            [
+                "첫 문단은 결론 또는 처리 방향을 1~2문장으로 짧게 쓰고, 다음 내용과 빈 줄로 구분하라.",
+                "비교, 정의, 처리 기준이 여러 개면 '기준: 내용', '처리: 내용'처럼 짧은 라벨 줄을 사용해 읽기 쉽게 정리하라.",
+                "근거는 마지막에 '근거:' 한 줄로 따로 두고 [DOC i]를 붙여라.",
+            ]
+        )
+        lines.extend(
+            [
+                "\ubb38\uc11c\uc5d0 \uba85\uc2dc, \ud56d\ubaa9\uc5d0 \uba85\uc2dc, \uc6d0\ubb38\uc744 \ud655\uc778, PDF\uc5d0\uc11c \ud655\uc778 \uac19\uc740 \ud45c\ud604\uc73c\ub85c \uc0ac\uc6a9\uc790\ub97c \ub2e4\uc2dc \uc790\ub8cc\ub85c \ub3cc\ub824\ubcf4\ub0b4\uc9c0 \ub9d0\ub77c.",
+                "\ud544\uc694\ud558\uba74 '\ucc98\ub9ac: ...', '\uae30\uc900: ...', '\uc8fc\uc758: ...'\ucc98\ub7fc \uc9e7\uc740 \ub77c\ubca8 \uc904\ub85c \ubc14\ub85c \uc815\ub9ac\ud558\ub77c.",
+            ]
+        )
+        if not _allow_general_knowledge_fallback(effective_user_message, kb_has_docs=kb_has_docs):
+            lines.append(
+                "문서 밖 참고 정보, 일반적 조언, 기관 문의 권고를 덧붙이지 말고 현재 문서에서 확인되는 사실과 확인되지 않는 부분만 답하라."
+            )
         if compact_history_block:
             if question_analysis.numeric_evidence_required:
                 lines.append(
@@ -7945,6 +8369,28 @@ async def chat(request: Request):
                     metrics=run_state.latest_metrics or retrieval_metrics,
                     overview_mode=overview_mode,
                 )
+                seeded_evidence_sufficient = _seeded_evidence_sufficient_for_answer()
+                allow_answer_retrieval_tool = bool(
+                    rag
+                    and ai_service.settings.enable_retrieval_tool
+                    and not seeded_evidence_sufficient
+                )
+                if seeded_evidence_sufficient:
+                    _append_phase_event(
+                        "answer_attempt",
+                        "retrieval_tools_disabled",
+                        status="info",
+                        detail="seeded_evidence_sufficient",
+                        payload={
+                            "attempt": attempt,
+                            "docs_available": len(run_state.docs),
+                            "strong_evidence_count": int(_doc_evidence_summary().get("strong_evidence_count", 0) or 0),
+                            "metrics_top1": float((run_state.latest_metrics or retrieval_metrics or {}).get("top1", 0.0) or 0.0),
+                            "metrics_coverage": float((run_state.latest_metrics or retrieval_metrics or {}).get("coverage", 0.0) or 0.0),
+                            "numeric_evidence_required": bool(question_analysis.numeric_evidence_required),
+                            "use_source_outline": bool(question_analysis.use_source_outline),
+                        },
+                    )
                 deps = CompassAgentDeps(
                     kb_name=kb_name,
                     query_id=query_id,
@@ -7961,9 +8407,11 @@ async def chat(request: Request):
                     source_outline_tool=_source_outline_tool,
                     list_sources_tool=_list_sources_tool,
                     citation_validator=_citation_issue,
+                    citation_repairer=_repair_missing_answer_citations,
+                    answer_sanitizer=_sanitize_outside_document_claims,
                     require_tool_evidence=bool(question_analysis.require_tool_evidence),
                     tool_event_baseline=tool_event_baseline,
-                    allow_retrieval_tool=bool(rag and ai_service.settings.enable_retrieval_tool),
+                    allow_retrieval_tool=allow_answer_retrieval_tool,
                 )
                 _append_phase_event(
                     "answer_attempt",
@@ -7975,6 +8423,8 @@ async def chat(request: Request):
                         "prompt_tokens_est": prompt_tokens,
                         "dynamic_max_tokens": dynamic_max_tokens,
                         "docs_available": len(run_state.docs),
+                        "seeded_evidence_sufficient": bool(seeded_evidence_sufficient),
+                        "allow_retrieval_tool": bool(allow_answer_retrieval_tool),
                     },
                 )
                 try:
@@ -8126,6 +8576,12 @@ async def chat(request: Request):
             yield fallback_text
 
     response = StreamingResponse(event_stream(), media_type="text/event-stream")
+    if (
+        rag_lease_state.get("context") is not None
+        and not bool(rag_lease_state.get("transferred_to_response", False))
+    ):
+        rag_lease_state["transferred_to_response"] = True
+        response.background = BackgroundTask(_release_rag_lease)
     response.headers["X-Conversation-Mode"] = conversation_mode
     response.headers["X-Query-Id"] = query_id
     return _attach_session_cookie(response, session_id)

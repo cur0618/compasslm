@@ -5,16 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export COMPASSLM_HOME="$(cd "${SCRIPT_DIR}/.." && pwd)"
 source "${SCRIPT_DIR}/load_gpu_env.sh"
 
-PORT_OVERRIDE_SET=0
-AUTO_PORT_OVERRIDE_SET=0
-[[ -n "${API_PORT+x}" ]] && PORT_OVERRIDE_SET=1 && API_PORT_OVERRIDE="${API_PORT}"
-[[ -n "${COMPASS_AUTO_PORT+x}" ]] && AUTO_PORT_OVERRIDE_SET=1 && AUTO_PORT_OVERRIDE="${COMPASS_AUTO_PORT}"
-
-compass_load_env_file "${MAIN_BACKEND_HOME}/.env.auto"
-compass_load_env_file "${PROJECT_GPU_HOME}/runtime.env"
-compass_load_env_file "${MAIN_BACKEND_HOME}/.env"
-[[ "${PORT_OVERRIDE_SET}" == "1" ]] && API_PORT="${API_PORT_OVERRIDE}"
-[[ "${AUTO_PORT_OVERRIDE_SET}" == "1" ]] && COMPASS_AUTO_PORT="${AUTO_PORT_OVERRIDE}"
+compass_load_service_env_files backend
 export PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK="${PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK:-True}"
 export PDF_OCR_ALLOW_ONLINE_MODEL_FALLBACK="${PDF_OCR_ALLOW_ONLINE_MODEL_FALLBACK:-0}"
 export PDF_OCR_OPTIMIZATION_PROFILE="${PDF_OCR_OPTIMIZATION_PROFILE:-h100_96gb_fast}"
@@ -81,11 +72,18 @@ export LLM_API_URL="${LIVE_LLM_API_URL}"
 echo "[INFO] API_HOST=${API_HOST} API_PORT=${API_PORT} API_RELOAD=${API_RELOAD}"
 echo "[INFO] EMBEDDING_PROVIDER=${EMBEDDING_PROVIDER}"
 echo "[INFO] EMBEDDING_API_URL=${EMBEDDING_API_URL:-}"
+echo "[INFO] EMBED_MODEL_DTYPE=${EMBED_MODEL_DTYPE:-bf16}"
+echo "[INFO] EMBED_MAX_QUERY_TOKENS=${EMBED_MAX_QUERY_TOKENS:-384}"
+echo "[INFO] EMBED_MAX_PASSAGE_TOKENS=${EMBED_MAX_PASSAGE_TOKENS:-768}"
+echo "[INFO] EMBED_MAX_BATCH_TOKENS=${EMBED_MAX_BATCH_TOKENS:-8192}"
+echo "[INFO] EMBED_LENGTH_BUCKETING=${EMBED_LENGTH_BUCKETING:-1}"
 echo "[INFO] LLM_API_URL=${LLM_API_URL:-}"
 echo "[INFO] LLM_CTX_SIZE=${LLM_CTX_SIZE:-}"
 echo "[INFO] LLM_CONTEXT_LIMIT=${LLM_CONTEXT_LIMIT:-}"
 echo "[INFO] PDF_PARSE_MODE=${PDF_PARSE_MODE}"
 echo "[INFO] PDF_TEXT_EXTRACTOR=${PDF_TEXT_EXTRACTOR:-pymupdf}"
+echo "[INFO] PDF_CHUNK_TARGET_TOKENS_REAL=${PDF_CHUNK_TARGET_TOKENS_REAL:-480}"
+echo "[INFO] PDF_CHUNK_MAX_TOKENS_REAL=${PDF_CHUNK_MAX_TOKENS_REAL:-640}"
 echo "[INFO] PDF_OCR_MODEL_NAME=${PDF_OCR_MODEL_NAME:-}"
 echo "[INFO] PDF_OCR_ALLOW_ONLINE_MODEL_FALLBACK=${PDF_OCR_ALLOW_ONLINE_MODEL_FALLBACK}"
 echo "[INFO] PDF_OCR_OPTIMIZATION_PROFILE=${PDF_OCR_OPTIMIZATION_PROFILE}"
@@ -140,11 +138,32 @@ else
   python -m uvicorn src.main:app --host "${API_HOST}" --port "${API_PORT}" &
 fi
 BACKEND_SERVER_PID="$!"
-trap 'kill "${BACKEND_SERVER_PID}" 2>/dev/null || true' INT TERM EXIT
+BACKEND_SHUTDOWN_REQUESTED=0
+
+compass_backend_shutdown() {
+  local exit_code="${1:-0}"
+  local reason="${2:-script_exit}"
+  local signal_name="${3:-TERM}"
+  if [[ "${BACKEND_SHUTDOWN_REQUESTED}" == "1" ]]; then
+    exit "${exit_code}"
+  fi
+  BACKEND_SHUTDOWN_REQUESTED=1
+  trap - INT TERM EXIT
+  compass_shutdown_child backend "${BACKEND_SERVER_PID:-}" "${reason}" "${signal_name}"
+  exit "${exit_code}"
+}
+
+trap 'compass_backend_shutdown 130 ctrl_c INT' INT
+trap 'compass_backend_shutdown 143 termination TERM' TERM
+trap 'compass_backend_shutdown 0 script_exit TERM' EXIT
 if ! compass_wait_for_backend_ready "${COMPASSLM_BASE_URL_SELECTED}" "${BACKEND_SERVER_PID}"; then
-  kill "${BACKEND_SERVER_PID}" 2>/dev/null || true
-  wait "${BACKEND_SERVER_PID}" 2>/dev/null || true
+  compass_shutdown_child backend "${BACKEND_SERVER_PID}" startup_failed TERM
   exit 1
 fi
 compass_write_service_state backend "${API_PORT}" "${COMPASSLM_BASE_URL_SELECTED}" "${BACKEND_SERVER_PID}"
+set +e
 wait "${BACKEND_SERVER_PID}"
+BACKEND_STATUS="$?"
+set -e
+trap - EXIT
+exit "${BACKEND_STATUS}"

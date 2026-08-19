@@ -1,8 +1,10 @@
 import gc
 import hmac
+import math
 import os
+import threading
 import traceback
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from fastapi import FastAPI, Header, HTTPException, status
@@ -126,6 +128,12 @@ EMBEDDING_DISABLE_AUTH = _env_bool("EMBEDDING_DISABLE_AUTH", False)
 EMBED_BATCH_SIZE = max(1, int(os.getenv("EMBED_BATCH_SIZE", "16")))
 EMBED_MIN_BATCH_SIZE = max(1, int(os.getenv("EMBED_MIN_BATCH_SIZE", "4")))
 EMBED_NORMALIZE = _env_bool("EMBED_NORMALIZE", True)
+EMBED_SERIALIZE_GPU_REQUESTS = _env_bool("EMBED_SERIALIZE_GPU_REQUESTS", True)
+EMBED_MAX_QUERY_TOKENS = max(32, int(os.getenv("EMBED_MAX_QUERY_TOKENS", "384")))
+EMBED_MAX_PASSAGE_TOKENS = max(64, int(os.getenv("EMBED_MAX_PASSAGE_TOKENS", "768")))
+EMBED_MAX_BATCH_TOKENS = max(256, int(os.getenv("EMBED_MAX_BATCH_TOKENS", "8192")))
+EMBED_LENGTH_BUCKETING = _env_bool("EMBED_LENGTH_BUCKETING", True)
+EMBED_MODEL_DTYPE = (os.getenv("EMBED_MODEL_DTYPE", "bf16") or "bf16").strip().lower()
 EMBEDDING_TASK_PREFIX_MODE_RAW = (os.getenv("EMBEDDING_TASK_PREFIX_MODE", "auto") or "auto").strip().lower()
 EMBEDDING_QWEN_QUERY_INSTRUCTION = (
     os.getenv(
@@ -143,6 +151,9 @@ COMPASSLM_HOME = os.path.abspath(os.path.join(PROJECT_GPU_HOME, ".."))
 
 if EMBED_MIN_BATCH_SIZE > EMBED_BATCH_SIZE:
     EMBED_MIN_BATCH_SIZE = EMBED_BATCH_SIZE
+
+
+_GPU_ENCODE_LOCK = threading.Lock()
 
 
 def _is_torch_oom(exc: Exception) -> bool:
@@ -170,6 +181,48 @@ def _clear_torch_cuda_cache():
                 torch.cuda.ipc_collect()
     except Exception:
         return
+
+
+def _model_uses_gpu(model: SentenceTransformer) -> bool:
+    if MODEL_DEVICE:
+        lowered = MODEL_DEVICE.strip().lower()
+        if lowered.startswith("cuda") or lowered.startswith("gpu"):
+            return True
+        if lowered == "cpu":
+            return False
+    target_device = getattr(model, "_target_device", None)
+    device_type = str(getattr(target_device, "type", "") or "").strip().lower()
+    if device_type == "cuda":
+        return True
+    return False
+
+
+def _gpu_memory_state() -> str:
+    if torch is None or not hasattr(torch, "cuda"):
+        return "unavailable"
+    try:
+        if not torch.cuda.is_available():
+            return "cuda_unavailable"
+        device_index = torch.cuda.current_device()
+        allocated = int(torch.cuda.memory_allocated(device_index))
+        reserved = int(torch.cuda.memory_reserved(device_index))
+        return f"allocated={allocated} reserved={reserved}"
+    except Exception as exc:
+        return f"unknown:{type(exc).__name__}"
+
+
+def _model_dtype_kwargs() -> Dict[str, Any]:
+    dtype_name = EMBED_MODEL_DTYPE.strip().lower()
+    if torch is None:
+        return {}
+    dtype = None
+    if dtype_name in {"bf16", "bfloat16"} and hasattr(torch, "bfloat16"):
+        dtype = torch.bfloat16
+    elif dtype_name in {"fp16", "float16", "half"} and hasattr(torch, "float16"):
+        dtype = torch.float16
+    if dtype is None:
+        return {}
+    return {"model_kwargs": {"torch_dtype": dtype}}
 
 
 def _resolve_large_model_id(raw_value: str) -> str:
@@ -237,6 +290,229 @@ def _apply_task_prefix(text: str, task: str, mode: str) -> str:
     if mode == "e5":
         return f"{task}: {value}"
     return value
+
+
+def _max_tokens_for_task(task: str) -> int:
+    if task == "query":
+        return EMBED_MAX_QUERY_TOKENS
+    return EMBED_MAX_PASSAGE_TOKENS
+
+
+def _model_tokenizer(model: SentenceTransformer):
+    tokenizer = getattr(model, "tokenizer", None)
+    if tokenizer is not None:
+        return tokenizer
+    first_module = None
+    try:
+        modules = getattr(model, "_modules", None)
+        if modules:
+            first_module = next(iter(modules.values()))
+    except Exception:
+        first_module = None
+    tokenizer = getattr(first_module, "tokenizer", None)
+    if tokenizer is not None:
+        return tokenizer
+    auto_model = getattr(model, "_first_module", None)
+    if callable(auto_model):
+        try:
+            first_module = auto_model()
+        except Exception:
+            first_module = None
+        tokenizer = getattr(first_module, "tokenizer", None)
+        if tokenizer is not None:
+            return tokenizer
+    return None
+
+
+def _coerce_input_ids(value: Any) -> Optional[List[List[int]]]:
+    if value is None:
+        return None
+    if hasattr(value, "tolist"):
+        try:
+            value = value.tolist()
+        except Exception:
+            return None
+    if not isinstance(value, (list, tuple)):
+        return None
+    if not value:
+        return []
+    first = value[0]
+    if isinstance(first, int):
+        return [[int(token) for token in value]]
+    rows: List[List[int]] = []
+    for row in value:
+        if hasattr(row, "tolist"):
+            try:
+                row = row.tolist()
+            except Exception:
+                return None
+        if not isinstance(row, (list, tuple)):
+            return None
+        rows.append([int(token) for token in row])
+    return rows
+
+
+def _extract_input_ids(encoded: Any) -> Optional[List[List[int]]]:
+    input_ids = None
+    if isinstance(encoded, dict):
+        input_ids = encoded.get("input_ids")
+    else:
+        try:
+            input_ids = encoded["input_ids"]
+        except Exception:
+            input_ids = getattr(encoded, "input_ids", None)
+    return _coerce_input_ids(input_ids)
+
+
+def _heuristic_token_lengths(texts: List[str]) -> List[int]:
+    lengths: List[int] = []
+    for text in texts:
+        value = str(text or "").strip()
+        if not value:
+            lengths.append(1)
+            continue
+        word_count = len(value.split())
+        char_estimate = max(1, math.ceil(len(value) / 4))
+        lengths.append(max(1, max(word_count, char_estimate)))
+    return lengths
+
+
+def _heuristic_truncate_text(text: str, before_tokens: int, max_tokens: int) -> str:
+    value = str(text or "").strip()
+    if before_tokens <= 0 or max_tokens <= 0 or before_tokens <= max_tokens:
+        return value
+    max_chars = max(1, int(len(value) * (float(max_tokens) / float(before_tokens))))
+    return value[:max_chars].strip() or value
+
+
+def _tokenize_texts(model: SentenceTransformer, texts: List[str]) -> List[List[int]]:
+    tokenizer = _model_tokenizer(model)
+    tokenization_errors: List[str] = []
+    if tokenizer is not None:
+        for kwargs in (
+            {"add_special_tokens": True, "truncation": False, "padding": False},
+            {},
+        ):
+            try:
+                encoded = tokenizer(list(texts), **kwargs)
+                input_ids = _extract_input_ids(encoded)
+                if input_ids is not None:
+                    return input_ids
+            except Exception as exc:
+                tokenization_errors.append(f"tokenizer:{type(exc).__name__}")
+
+    model_tokenize = getattr(model, "tokenize", None)
+    if callable(model_tokenize):
+        try:
+            encoded = model_tokenize(list(texts))
+            input_ids = _extract_input_ids(encoded)
+            if input_ids is not None:
+                return input_ids
+        except Exception as exc:
+            tokenization_errors.append(f"model.tokenize:{type(exc).__name__}")
+
+    detail = ", ".join(tokenization_errors) if tokenization_errors else "no usable tokenizer"
+    raise RuntimeError(f"Embedding tokenizer did not return input_ids ({detail}).")
+
+
+def _truncate_prefixed_texts(
+    model: SentenceTransformer,
+    texts: List[str],
+    *,
+    max_tokens: int,
+) -> Tuple[List[str], List[int], List[int]]:
+    if not texts:
+        return [], [], []
+    tokenizer = _model_tokenizer(model)
+    if tokenizer is None:
+        lengths = _heuristic_token_lengths(list(texts))
+        truncated = [min(length, max_tokens) for length in lengths]
+        return list(texts), lengths, truncated
+
+    try:
+        tokenized = _tokenize_texts(model, texts)
+    except RuntimeError as exc:
+        print(f"[WARN] Embedding tokenizer length fallback: {exc}", flush=True)
+        lengths = _heuristic_token_lengths(list(texts))
+        truncated_lengths = [min(length, max_tokens) for length in lengths]
+        truncated_texts = [
+            _heuristic_truncate_text(text, before_tokens=length, max_tokens=max_tokens)
+            if length > max_tokens
+            else str(text or "").strip()
+            for text, length in zip(texts, lengths)
+        ]
+        return truncated_texts, lengths, truncated_lengths
+    before_lengths = [len(ids) for ids in tokenized]
+    if max_tokens <= 0:
+        return list(texts), before_lengths, before_lengths
+
+    truncated_texts: List[str] = []
+    after_lengths: List[int] = []
+    for text, input_ids in zip(texts, tokenized):
+        if len(input_ids) <= max_tokens:
+            truncated_texts.append(text)
+            after_lengths.append(len(input_ids))
+            continue
+        trimmed_ids = input_ids[:max_tokens]
+        decoded = ""
+        decode = getattr(tokenizer, "decode", None)
+        if callable(decode):
+            try:
+                decoded = decode(trimmed_ids, skip_special_tokens=True)
+            except Exception:
+                decoded = ""
+        if not str(decoded or "").strip():
+            decoded = _heuristic_truncate_text(text, before_tokens=len(input_ids), max_tokens=max_tokens)
+        truncated_texts.append(decoded.strip() or str(text or "").strip())
+        after_lengths.append(len(trimmed_ids))
+    return truncated_texts, before_lengths, after_lengths
+
+
+def _build_tokenized_inputs(
+    model: SentenceTransformer,
+    texts: List[str],
+    *,
+    task: str,
+    mode: str,
+) -> Dict[str, Any]:
+    prefixed = [_apply_task_prefix((text or ""), task=task, mode=mode) for text in texts]
+    truncated, input_lengths, effective_lengths = _truncate_prefixed_texts(
+        model,
+        prefixed,
+        max_tokens=_max_tokens_for_task(task),
+    )
+    return {
+        "prefixed_texts": prefixed,
+        "texts": truncated,
+        "input_lengths": input_lengths,
+        "effective_lengths": effective_lengths,
+        "truncated_inputs": sum(1 for before, after in zip(input_lengths, effective_lengths) if after < before),
+        "max_seq_length": int(_max_tokens_for_task(task)),
+    }
+
+
+def _bucketed_batch_plan(lengths: List[int], max_rows: int, max_batch_tokens: int) -> List[List[int]]:
+    if not lengths:
+        return []
+    indexed = list(enumerate(lengths))
+    if EMBED_LENGTH_BUCKETING:
+        indexed.sort(key=lambda item: (item[1], item[0]))
+
+    batches: List[List[int]] = []
+    current: List[int] = []
+    current_tokens = 0
+    for row_index, token_len in indexed:
+        bounded_len = max(1, int(token_len or 0))
+        next_tokens = current_tokens + bounded_len
+        if current and (len(current) >= max_rows or next_tokens > max_batch_tokens):
+            batches.append(current)
+            current = []
+            current_tokens = 0
+        current.append(row_index)
+        current_tokens += bounded_len
+    if current:
+        batches.append(current)
+    return batches
 
 
 def _prompt_name_aliases_for_task(task: str) -> List[str]:
@@ -331,54 +607,116 @@ def _encode_with_adaptive_batches(
     texts: List[str],
     task: str,
     mode: str,
-) -> np.ndarray:
+) -> tuple[np.ndarray, dict]:
     if not texts:
-        return np.empty((0, 0), dtype=np.float32)
+        return np.empty((0, 0), dtype=np.float32), {
+            "adaptive_batch_initial": 0,
+            "adaptive_batch_final": 0,
+            "adaptive_batch_retry_count": 0,
+            "gpu_memory_state_before_retry": "",
+            "truncated_inputs": 0,
+            "max_input_tokens": 0,
+            "p95_input_tokens": 0,
+            "total_input_tokens": 0,
+            "effective_batch_count": 0,
+            "effective_batch_tokens_max": 0,
+            "dtype": EMBED_MODEL_DTYPE,
+            "device": MODEL_DEVICE or "",
+        }
+    prepared = _build_tokenized_inputs(model, texts, task=task, mode=mode)
+    encode_texts = list(prepared["texts"])
+    effective_lengths = list(prepared["effective_lengths"])
+    plan = _bucketed_batch_plan(
+        effective_lengths,
+        max_rows=min(EMBED_BATCH_SIZE, len(encode_texts)),
+        max_batch_tokens=EMBED_MAX_BATCH_TOKENS,
+    )
+    merged_by_row: Dict[int, np.ndarray] = {}
+    retry_count = 0
+    initial_batch_size = min(EMBED_BATCH_SIZE, len(encode_texts))
+    final_batch_size = initial_batch_size
+    last_gpu_memory_state = ""
+    effective_batch_tokens_max = 0
 
-    current_batch_size = min(EMBED_BATCH_SIZE, len(texts))
-    merged: List[np.ndarray] = []
-    start = 0
+    pending_batches: List[List[int]] = [list(batch) for batch in plan]
+    while pending_batches:
+        batch_indexes = pending_batches.pop(0)
+        current_indexes = list(batch_indexes)
+        current_batch_size = len(current_indexes)
+        while True:
+            batch = [encode_texts[row_index] for row_index in current_indexes]
+            batch_tokens = sum(effective_lengths[row_index] for row_index in current_indexes)
+            effective_batch_tokens_max = max(effective_batch_tokens_max, batch_tokens)
+            try:
+                arr = _encode_with_mode(
+                    model=model,
+                    texts=batch,
+                    task=task,
+                    mode=mode,
+                    batch_size=max(1, current_batch_size),
+                )
+                for output_offset, row_index in enumerate(current_indexes):
+                    merged_by_row[row_index] = np.asarray(arr[output_offset], dtype=np.float32)
+                final_batch_size = max(1, current_batch_size)
+                break
+            except Exception as e:
+                if not _is_torch_oom(e):
+                    raise
+                retry_count += 1
+                last_gpu_memory_state = _gpu_memory_state()
+                _clear_torch_cuda_cache()
+                if current_batch_size <= EMBED_MIN_BATCH_SIZE or len(current_indexes) <= 1:
+                    raise RuntimeError(
+                        "Embedding CUDA out of memory even after reducing batch size "
+                        f"to {current_batch_size}. Lower EMBED_MAX_BATCH_TOKENS/EMBED_BATCH_SIZE "
+                        "or free GPU memory from competing processes."
+                    ) from e
+                next_batch_size = max(EMBED_MIN_BATCH_SIZE, current_batch_size // 2)
+                if next_batch_size >= current_batch_size:
+                    next_batch_size = max(1, current_batch_size - 1)
+                split_head = current_indexes[:next_batch_size]
+                split_tail = current_indexes[next_batch_size:]
+                current_indexes = split_head
+                current_batch_size = len(current_indexes)
+                if split_tail:
+                    pending_batches.insert(0, split_tail)
+                print(
+                    "[WARN] Embedding CUDA OOM "
+                    f"task={task} request_count={len(texts)} "
+                    f"batch_count={len(batch)} batch_size={len(batch_indexes)} -> retry {current_batch_size} "
+                    f"gpu_memory_state_before_retry={last_gpu_memory_state or '-'}"
+                )
 
-    while start < len(texts):
-        batch = texts[start : start + current_batch_size]
-        try:
-            arr = _encode_with_mode(
-                model=model,
-                texts=batch,
-                task=task,
-                mode=mode,
-                batch_size=current_batch_size,
-            )
-            merged.append(arr)
-            start += len(batch)
-        except Exception as e:
-            if not _is_torch_oom(e):
-                raise
+    if _model_uses_gpu(model):
+        _clear_torch_cuda_cache()
 
-            _clear_torch_cuda_cache()
-            if current_batch_size <= EMBED_MIN_BATCH_SIZE:
-                raise RuntimeError(
-                    "Embedding CUDA out of memory even after reducing batch size "
-                    f"to {current_batch_size}. Lower EMBED_BATCH_SIZE/EMBEDDING_API_BATCH_SIZE "
-                    "or free GPU memory from competing processes."
-                ) from e
-
-            next_batch_size = max(EMBED_MIN_BATCH_SIZE, current_batch_size // 2)
-            if next_batch_size == current_batch_size:
-                next_batch_size = max(1, current_batch_size - 1)
-            print(
-                "[WARN] Embedding CUDA OOM "
-                f"task={task} start={start} request_count={len(texts)} "
-                f"batch_count={len(batch)} batch_size={current_batch_size} -> retry {next_batch_size}"
-            )
-            current_batch_size = next_batch_size
-
-    if len(merged) == 1:
-        return merged[0]
-    return np.concatenate(merged, axis=0)
+    ordered = [merged_by_row[row_index] for row_index in range(len(encode_texts))]
+    result = np.asarray(np.vstack(ordered), dtype=np.float32)
+    sorted_lengths = sorted(int(length) for length in effective_lengths)
+    p95_index = max(0, min(len(sorted_lengths) - 1, math.ceil(len(sorted_lengths) * 0.95) - 1))
+    return result, {
+        "adaptive_batch_initial": int(initial_batch_size),
+        "adaptive_batch_final": int(final_batch_size),
+        "adaptive_batch_retry_count": int(retry_count),
+        "gpu_memory_state_before_retry": last_gpu_memory_state,
+        "truncated_inputs": int(prepared["truncated_inputs"]),
+        "max_input_tokens": int(max(effective_lengths) if effective_lengths else 0),
+        "p95_input_tokens": int(sorted_lengths[p95_index] if sorted_lengths else 0),
+        "total_input_tokens": int(sum(effective_lengths)),
+        "effective_batch_count": int(len(plan)),
+        "effective_batch_tokens_max": int(effective_batch_tokens_max),
+        "dtype": EMBED_MODEL_DTYPE,
+        "device": str(getattr(getattr(model, "_target_device", None), "type", "") or MODEL_DEVICE or ""),
+    }
 
 
 class EmbedRequest(BaseModel):
+    texts: List[str]
+    task: str
+    index_name: Optional[str] = None
+
+
+class TokenizeLengthsRequest(BaseModel):
     texts: List[str]
     task: str
     index_name: Optional[str] = None
@@ -388,6 +726,14 @@ class EmbedResponse(BaseModel):
     vectors: List[List[float]]
     dim: int
     index_name: str
+    model_id: str
+    diagnostics: Dict[str, Any]
+
+
+class TokenizeLengthsResponse(BaseModel):
+    lengths: List[int]
+    max_seq_length: int
+    task_prefix_mode: str
     model_id: str
 
 
@@ -422,14 +768,27 @@ class ModelRegistry:
 
         kwargs = {"device": MODEL_DEVICE} if MODEL_DEVICE else {}
         kwargs.update(_embedding_model_load_kwargs(LARGE_MODEL_ID))
+        kwargs.update(_model_dtype_kwargs())
         try:
             model = SentenceTransformer(LARGE_MODEL_ID, **kwargs)
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to load embedding model '{LARGE_MODEL_ID}'. "
-                "Check EMBEDDING_MODEL_LARGE_PATH and model files."
-                f"{_embedding_model_requirements_hint(LARGE_MODEL_ID)}"
-            ) from e
+        except Exception as first_error:
+            if "model_kwargs" in kwargs:
+                fallback_kwargs = dict(kwargs)
+                fallback_kwargs.pop("model_kwargs", None)
+                try:
+                    model = SentenceTransformer(LARGE_MODEL_ID, **fallback_kwargs)
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Failed to load embedding model '{LARGE_MODEL_ID}'. "
+                        "Check EMBEDDING_MODEL_LARGE_PATH and model files."
+                        f"{_embedding_model_requirements_hint(LARGE_MODEL_ID)}"
+                    ) from e
+            else:
+                raise RuntimeError(
+                    f"Failed to load embedding model '{LARGE_MODEL_ID}'. "
+                    "Check EMBEDDING_MODEL_LARGE_PATH and model files."
+                    f"{_embedding_model_requirements_hint(LARGE_MODEL_ID)}"
+                ) from first_error
         task_prefix_mode = _resolve_task_prefix_mode(
             model_id=LARGE_MODEL_ID,
             requested_mode=EMBEDDING_TASK_PREFIX_MODE_RAW,
@@ -471,6 +830,11 @@ class ModelRegistry:
             self.get("large")
         return self._task_prefix_mode or "none"
 
+    def close(self) -> None:
+        self._model = None
+        self._dim = None
+        self._task_prefix_mode = None
+
 
 registry = ModelRegistry()
 app = FastAPI(title="CompassLM Embedding GPU Server", version="0.1.0")
@@ -490,7 +854,7 @@ def _authorize(authorization: Optional[str]):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
 
 
-def _validate_request(payload: EmbedRequest):
+def _validate_request(payload: Any):
     if payload.task not in {"query", "passage"}:
         raise HTTPException(status_code=400, detail="task must be 'query' or 'passage'")
     if not payload.texts:
@@ -502,6 +866,16 @@ def _validate_request(payload: EmbedRequest):
 @app.on_event("startup")
 def _startup():
     registry.get("large")
+
+
+@app.on_event("shutdown")
+def _shutdown():
+    try:
+        registry.close()
+        _clear_torch_cuda_cache()
+        print("[EMBED][SHUTDOWN] status=clean cuda_cache_cleared=1", flush=True)
+    except Exception as exc:
+        print(f"[EMBED][SHUTDOWN][WARN] status=error error={type(exc).__name__}: {exc}", flush=True)
 
 
 @app.get("/health")
@@ -517,9 +891,31 @@ def health():
                 "task_prefix_mode": registry.task_prefix_mode("large"),
                 "embed_batch_size": EMBED_BATCH_SIZE,
                 "embed_min_batch_size": EMBED_MIN_BATCH_SIZE,
+                "embed_serialize_gpu_requests": EMBED_SERIALIZE_GPU_REQUESTS,
+                "embed_max_query_tokens": EMBED_MAX_QUERY_TOKENS,
+                "embed_max_passage_tokens": EMBED_MAX_PASSAGE_TOKENS,
+                "embed_max_batch_tokens": EMBED_MAX_BATCH_TOKENS,
+                "embed_model_dtype": EMBED_MODEL_DTYPE,
+                "embed_length_bucketing": EMBED_LENGTH_BUCKETING,
             },
         },
     }
+
+
+@app.post("/tokenize_lengths", response_model=TokenizeLengthsResponse)
+def tokenize_lengths(payload: TokenizeLengthsRequest, authorization: Optional[str] = Header(default=None)):
+    _authorize(authorization)
+    _validate_request(payload)
+    index_name = _normalize_index_name(payload.index_name)
+    model = registry.get(index_name)
+    task_prefix_mode = registry.task_prefix_mode(index_name)
+    prepared = _build_tokenized_inputs(model, payload.texts, task=payload.task, mode=task_prefix_mode)
+    return TokenizeLengthsResponse(
+        lengths=[int(length) for length in list(prepared["effective_lengths"])],
+        max_seq_length=int(prepared["max_seq_length"]),
+        task_prefix_mode=task_prefix_mode,
+        model_id=registry.model_id(index_name),
+    )
 
 
 @app.post("/embed", response_model=EmbedResponse)
@@ -531,19 +927,45 @@ def embed(payload: EmbedRequest, authorization: Optional[str] = Header(default=N
         index_name = _normalize_index_name(payload.index_name)
         model = registry.get(index_name)
         task_prefix_mode = registry.task_prefix_mode(index_name)
-        prefixed = [_apply_task_prefix((text or ""), task=payload.task, mode=task_prefix_mode) for text in payload.texts]
-        arr = _encode_with_adaptive_batches(
-            model=model,
-            texts=prefixed,
-            task=payload.task,
-            mode=task_prefix_mode,
+        request_serialized = EMBED_SERIALIZE_GPU_REQUESTS and _model_uses_gpu(model)
+        if request_serialized:
+            with _GPU_ENCODE_LOCK:
+                arr, diagnostics = _encode_with_adaptive_batches(
+                    model=model,
+                    texts=payload.texts,
+                    task=payload.task,
+                    mode=task_prefix_mode,
+                )
+        else:
+            arr, diagnostics = _encode_with_adaptive_batches(
+                model=model,
+                texts=payload.texts,
+                task=payload.task,
+                mode=task_prefix_mode,
+            )
+        print(
+            f"[EMBED][DONE] task={payload.task} count={len(payload.texts)} "
+            f"index={index_name} request_serialized={'yes' if request_serialized else 'no'} "
+            f"adaptive_batch_initial={diagnostics.get('adaptive_batch_initial', 0)} "
+            f"adaptive_batch_final={diagnostics.get('adaptive_batch_final', 0)} "
+            f"adaptive_batch_retry_count={diagnostics.get('adaptive_batch_retry_count', 0)} "
+            f"effective_batch_tokens_max={diagnostics.get('effective_batch_tokens_max', 0)} "
+            f"max_input_tokens={diagnostics.get('max_input_tokens', 0)} "
+            f"truncated_inputs={diagnostics.get('truncated_inputs', 0)}",
+            flush=True,
         )
     except HTTPException:
         raise
     except Exception as e:
         print(
             f"[EMBED][ERROR] task={payload.task} count={len(payload.texts)} "
-            f"index={payload.index_name or DEFAULT_INDEX} error={type(e).__name__}: {e}"
+            f"index={payload.index_name or DEFAULT_INDEX} "
+            f"request_serialized={'yes' if ('request_serialized' in locals() and request_serialized) else 'no'} "
+            f"adaptive_batch_initial={int((diagnostics if 'diagnostics' in locals() else {}).get('adaptive_batch_initial', 0) or 0)} "
+            f"adaptive_batch_final={int((diagnostics if 'diagnostics' in locals() else {}).get('adaptive_batch_final', 0) or 0)} "
+            f"adaptive_batch_retry_count={int((diagnostics if 'diagnostics' in locals() else {}).get('adaptive_batch_retry_count', 0) or 0)} "
+            f"gpu_memory_state_before_retry={str((diagnostics if 'diagnostics' in locals() else {}).get('gpu_memory_state_before_retry', '') or '-') } "
+            f"error={type(e).__name__}: {e}"
         )
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}") from e
@@ -553,4 +975,8 @@ def embed(payload: EmbedRequest, authorization: Optional[str] = Header(default=N
         dim=int(arr.shape[1]),
         index_name=index_name,
         model_id=registry.model_id(index_name),
+        diagnostics={
+            **dict(diagnostics or {}),
+            "request_serialized": "yes" if request_serialized else "no",
+        },
     )

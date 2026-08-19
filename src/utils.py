@@ -21,6 +21,7 @@ HEADER_FOOTER_PATTERNS = (
 )
 TOKEN_PATTERN = re.compile(r"[0-9A-Za-z가-힣]+")
 WHITESPACE_PATTERN = re.compile(r"\s+")
+SAFE_TOKEN_PATTERN = re.compile(r"[0-9A-Za-z\u3131-\u318E\uAC00-\uD7A3]+")
 
 
 def detect_encoding(file_path: str) -> str:
@@ -73,8 +74,19 @@ def _estimate_tokens(text: str) -> int:
     # Lightweight heuristic for chunk sizing.
     if not text:
         return 0
-    tokens = TOKEN_PATTERN.findall(text)
+    tokens = SAFE_TOKEN_PATTERN.findall(text) or TOKEN_PATTERN.findall(text)
     return max(1, int(len(tokens) * 1.08))
+
+
+def _resolve_token_count(measured_lengths: Optional[List[int]], index: int, text: str) -> int:
+    if measured_lengths is None:
+        return _estimate_tokens(text)
+    if index < 0 or index >= len(measured_lengths):
+        return _estimate_tokens(text)
+    try:
+        return max(1, int(measured_lengths[index] or 0))
+    except (TypeError, ValueError):
+        return _estimate_tokens(text)
 
 
 def load_txt(file_path: str) -> List[Dict[str, Any]]:
@@ -398,6 +410,7 @@ def chunk_txt_items(
     min_tokens: int = 420,
     max_tokens: int = 780,
     overlap_ratio: float = 0.15,
+    measured_lengths: Optional[List[int]] = None,
 ) -> List[Dict[str, Any]]:
     """Chunk TXT lines with section retention and token overlap."""
     if not lines:
@@ -415,7 +428,7 @@ def chunk_txt_items(
 
         while end < n:
             line_text = lines[end]["text"]
-            add_tokens = _estimate_tokens(line_text)
+            add_tokens = _resolve_token_count(measured_lengths, end, line_text)
             if end > start and used_tokens + add_tokens > max_tokens:
                 break
             used_tokens += add_tokens
@@ -425,7 +438,7 @@ def chunk_txt_items(
                 break
 
         while end < n and used_tokens < min_tokens:
-            add_tokens = _estimate_tokens(lines[end]["text"])
+            add_tokens = _resolve_token_count(measured_lengths, end, lines[end]["text"])
             if end > start and used_tokens + add_tokens > max_tokens:
                 break
             used_tokens += add_tokens
@@ -459,7 +472,7 @@ def chunk_txt_items(
         next_start = end
         while next_start > start and back_tokens < overlap_tokens:
             next_start -= 1
-            back_tokens += _estimate_tokens(lines[next_start].get("text", ""))
+            back_tokens += _resolve_token_count(measured_lengths, next_start, lines[next_start].get("text", ""))
 
         if next_start <= start:
             start = end

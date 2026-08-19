@@ -51,6 +51,10 @@ def build_scoped_kb_id(user_id: str, display_name: str) -> str:
     return f"{user_part}__{name_part}__{digest}"
 
 
+def build_fresh_scoped_kb_id(user_id: str, display_name: str) -> str:
+    return f"{build_scoped_kb_id(user_id, display_name)}__{uuid.uuid4().hex[:10]}"
+
+
 def hash_password(password: str, *, iterations: int = PBKDF2_ITERATIONS) -> str:
     if not password:
         raise ValueError("password must not be empty")
@@ -308,6 +312,36 @@ class AuthStore:
             conn.commit()
             conn.close()
 
+    def prune_expired_sessions(
+        self,
+        *,
+        now_ts: Optional[int] = None,
+        limit: int = 1000,
+    ) -> int:
+        now_value = int(time.time()) if now_ts is None else int(now_ts)
+        with self._lock:
+            conn = self._connect()
+            rows = conn.execute(
+                """
+                SELECT session_token_hash
+                FROM user_sessions
+                WHERE expires_at <= ?
+                ORDER BY expires_at ASC
+                LIMIT ?
+                """,
+                (now_value, max(1, int(limit or 1))),
+            ).fetchall()
+            session_hashes = [str(row[0]) for row in rows if str(row[0] or "")]
+            if session_hashes:
+                placeholders = ",".join("?" for _ in session_hashes)
+                conn.execute(
+                    f"DELETE FROM user_sessions WHERE session_token_hash IN ({placeholders})",
+                    tuple(session_hashes),
+                )
+                conn.commit()
+            conn.close()
+        return len(session_hashes)
+
     def create_kb(
         self,
         owner_user_id: str,
@@ -318,6 +352,7 @@ class AuthStore:
     ) -> Dict[str, Any]:
         _reject_path_like(display_name)
         now_ts = int(time.time())
+        explicit_internal_id = internal_kb_id is not None
         resolved_internal = internal_kb_id or build_scoped_kb_id(owner_user_id, display_name)
         _reject_path_like(resolved_internal)
         resolved_kb_id = kb_id or f"kb_{uuid.uuid4().hex[:16]}"
@@ -332,18 +367,46 @@ class AuthStore:
                 if existing_internal:
                     if str(existing_internal["owner_user_id"]) != str(owner_user_id):
                         raise ValueError("kb internal_kb_id already exists")
+                    if explicit_internal_id:
+                        c.execute(
+                            """
+                            UPDATE user_kbs
+                            SET is_deleted = 0, updated_at = ?
+                            WHERE kb_id = ?
+                            """,
+                            (now_ts, existing_internal["kb_id"]),
+                        )
+                        conn.commit()
+                        row = c.execute(
+                            "SELECT * FROM user_kbs WHERE kb_id = ? AND is_deleted = 0",
+                            (existing_internal["kb_id"],),
+                        ).fetchone()
+                        return dict(row)
+                    if int(existing_internal["is_deleted"] or 0) == 0:
+                        return dict(existing_internal)
+                    resolved_internal = build_fresh_scoped_kb_id(owner_user_id, display_name)
+
+                existing_display = c.execute(
+                    """
+                    SELECT *
+                    FROM user_kbs
+                    WHERE owner_user_id = ? AND display_name = ?
+                    """,
+                    (owner_user_id, display_name),
+                ).fetchone()
+                if existing_display and int(existing_display["is_deleted"] or 0) != 0 and not explicit_internal_id:
                     c.execute(
                         """
                         UPDATE user_kbs
-                        SET is_deleted = 0, updated_at = ?
-                        WHERE kb_id = ?
+                        SET kb_id = ?, internal_kb_id = ?, created_at = ?, updated_at = ?, is_deleted = 0
+                        WHERE owner_user_id = ? AND display_name = ?
                         """,
-                        (now_ts, existing_internal["kb_id"]),
+                        (resolved_kb_id, resolved_internal, now_ts, now_ts, owner_user_id, display_name),
                     )
                     conn.commit()
                     row = c.execute(
                         "SELECT * FROM user_kbs WHERE kb_id = ? AND is_deleted = 0",
-                        (existing_internal["kb_id"],),
+                        (resolved_kb_id,),
                     ).fetchone()
                     return dict(row)
 

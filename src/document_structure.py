@@ -5,16 +5,18 @@ from typing import Any, Dict, Iterable, List, Optional
 
 WHITESPACE_RE = re.compile(r"\s+")
 CHUNK_KIND_LABELS = {
-    "heading": "제목",
-    "body": "본문",
-    "definition": "정의",
-    "condition": "조건",
-    "exception": "예외",
-    "table_title": "표 제목",
-    "table_header": "표 헤더",
-    "table_row": "표 행",
-    "table_summary": "표 요약",
+    "heading": "heading",
+    "body": "body",
+    "definition": "definition",
+    "condition": "condition",
+    "exception": "exception",
+    "table_title": "table_title",
+    "table_header": "table_header",
+    "table_row": "table_row",
+    "table_summary": "table_summary",
 }
+EMBEDDING_TEXT_MAX_CHARS = max(240, int(os.getenv("EMBEDDING_TEXT_MAX_CHARS", "2400")))
+EMBEDDING_BODY_MAX_CHARS = max(120, int(os.getenv("EMBEDDING_BODY_MAX_CHARS", "1800")))
 
 
 def _clean(value: Any) -> str:
@@ -36,6 +38,15 @@ def normalize_heading_path(value: Any) -> List[str]:
     return result
 
 
+def _truncate_with_ellipsis(text: str, limit: int) -> str:
+    value = str(text or "").strip()
+    if limit <= 0 or len(value) <= limit:
+        return value
+    if limit <= 3:
+        return value[:limit]
+    return value[: limit - 3].rstrip() + "..."
+
+
 def build_embedding_text(
     *,
     text: str,
@@ -44,21 +55,27 @@ def build_embedding_text(
     heading_path: Optional[Iterable[str]] = None,
     chunk_kind: str = "body",
 ) -> str:
-    original = str(text or "").strip()
+    body = _truncate_with_ellipsis(_clean(text), EMBEDDING_BODY_MAX_CHARS)
     headings = normalize_heading_path(list(heading_path or []))
-    lines: List[str] = []
     filename = os.path.basename(str(source_path or "").strip())
-    if filename:
-        lines.append(f"문서: {filename}")
     role = _clean(doc_role)
-    if role:
-        lines.append(f"역할: {role}")
-    if headings:
-        lines.append(f"경로: {' > '.join(headings)}")
     kind = _clean(chunk_kind) or "body"
-    lines.append(f"유형: {CHUNK_KIND_LABELS.get(kind, kind)}")
-    lines.append(f"내용: {original}")
-    return "\n".join(lines)
+
+    header_parts: List[str] = []
+    if filename:
+        header_parts.append(f"source={filename}")
+    if role:
+        header_parts.append(f"role={role}")
+    if headings:
+        header_parts.append(f"path={' > '.join(headings)}")
+    if kind and kind != "body":
+        header_parts.append(f"kind={CHUNK_KIND_LABELS.get(kind, kind)}")
+
+    if header_parts:
+        result = "\n".join([" | ".join(header_parts), body])
+    else:
+        result = body
+    return _truncate_with_ellipsis(result, EMBEDDING_TEXT_MAX_CHARS)
 
 
 def normalize_structure_record(

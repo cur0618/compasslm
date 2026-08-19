@@ -46,6 +46,22 @@ class FrontendVisualContractTests(unittest.TestCase):
         self.assertIn(".citation-chip::after", style_source)
         self.assertIn(".citation-chip:focus-visible::after", style_source)
 
+    def test_assistant_answer_renderer_has_structured_reading_contract(self):
+        style_source = (ROOT / "src" / "static" / "style.css").read_text(encoding="utf-8")
+        script_source = (ROOT / "src" / "static" / "script.js").read_text(encoding="utf-8")
+
+        self.assertIn("splitAssistantParagraphs", script_source)
+        self.assertIn("renderAssistantEvidence", script_source)
+        self.assertIn("answer-paragraph-lead", script_source)
+        self.assertIn("answer-structured-list", script_source)
+        self.assertIn(".answer-paragraph", style_source)
+        self.assertIn(".answer-evidence", style_source)
+        self.assertIn(".answer-row", style_source)
+        self.assertNotRegex(
+            style_source,
+            re.compile(r"\.answer-(?:paragraph|evidence|row)[^{]*\{[^}]*linear-gradient", re.DOTALL),
+        )
+
     def test_script_defines_document_pending_status_messages(self):
         script_source = (ROOT / "src" / "static" / "script.js").read_text(encoding="utf-8")
         self.assertIn("문서를 확인 중입니다. 잠시만 기다려 주세요.", script_source)

@@ -48,6 +48,7 @@ let ocrPollTimerId = 0;
 let ocrStatusPopoverOpen = false;
 let currentUser = null;
 let chatStateCache = emptyChatState();
+let kbRecordByName = new Map();
 let wikiStatusFilter = '';
 let wikiActiveTab = 'Answers';
 let ontologyRebuildPollTimerId = 0;
@@ -455,17 +456,27 @@ function renderOntologyFacts(facts = [], rebuildJobs = []) {
         return;
     }
     safeFacts.forEach(fact => {
-        const item = document.createElement('button');
-        item.type = 'button';
-        item.className = 'wiki-page-item';
+        const item = document.createElement('div');
+        item.className = 'wiki-page-item fact-row';
+        item.setAttribute('role', 'button');
+        item.tabIndex = 0;
         const factId = String(fact.fact_id || '');
         const title = `${String(fact.subject || '')} --${String(fact.predicate || '')}--> ${String(fact.object_entity || fact.object_value || '')}`;
-        item.innerHTML = (
+        const body = document.createElement('div');
+        body.className = 'wiki-page-body';
+        body.innerHTML = (
             `<span class="wiki-page-title">${escapeHtml(title)}</span>` +
             `<span class="wiki-page-meta">fact · ${escapeHtml(String(fact.status || 'active'))} · confidence ${Number(fact.confidence || 0).toFixed(2)}</span>`
         );
-        item.addEventListener('click', async () => {
+        item.appendChild(body);
+        const openDetail = async () => {
             await loadOntologyFactDetail(factId);
+        };
+        item.addEventListener('click', openDetail);
+        item.addEventListener('keydown', async (event) => {
+            if (event.key !== 'Enter' && event.key !== ' ') return;
+            event.preventDefault();
+            await openDetail();
         });
         if (currentUser && currentUser.role === 'admin') {
             const actions = document.createElement('div');
@@ -985,6 +996,64 @@ function normalizeKBName(kbName) {
     return value || 'default';
 }
 
+function normalizeKBRecord(raw = {}) {
+    const name = normalizeKBName(raw.display_name || raw.name || raw.kb_name || '');
+    return {
+        name,
+        display_name: name,
+        kb_id: String(raw.kb_id || ''),
+        internal_kb_id: normalizeKBName(raw.internal_kb_id || name)
+    };
+}
+
+function rememberKBRecord(raw = {}) {
+    const record = normalizeKBRecord(raw);
+    kbRecordByName.set(record.name, record);
+    return record;
+}
+
+function replaceKBRecords(kbNames = [], records = []) {
+    kbRecordByName = new Map();
+    const normalizedRecords = Array.isArray(records) ? records.map(item => normalizeKBRecord(item)) : [];
+    normalizedRecords.forEach(record => {
+        kbRecordByName.set(record.name, record);
+    });
+    (Array.isArray(kbNames) ? kbNames : []).forEach(name => {
+        const safeName = normalizeKBName(name);
+        if (!kbRecordByName.has(safeName)) {
+            kbRecordByName.set(safeName, normalizeKBRecord({ name: safeName, internal_kb_id: safeName }));
+        }
+    });
+}
+
+function kbRecordForName(kbName) {
+    const safeKB = normalizeKBName(kbName);
+    return kbRecordByName.get(safeKB) || normalizeKBRecord({ name: safeKB, internal_kb_id: safeKB });
+}
+
+function chatBucketKeyForKB(kbName) {
+    return normalizeKBName(kbRecordForName(kbName).internal_kb_id || kbName);
+}
+
+function chatBucketKeysForKB(kbName) {
+    const safeKB = normalizeKBName(kbName);
+    return [...new Set([chatBucketKeyForKB(safeKB), safeKB])];
+}
+
+function migratePersistedChatBucketsForRecords() {
+    if (!chatStateCache.chats || typeof chatStateCache.chats !== 'object') return;
+    kbRecordByName.forEach(record => {
+        const displayKey = normalizeKBName(record.name);
+        const bucketKey = normalizeKBName(record.internal_kb_id || displayKey);
+        if (displayKey === bucketKey) return;
+        if (Array.isArray(chatStateCache.chats[displayKey]) && !Array.isArray(chatStateCache.chats[bucketKey])) {
+            chatStateCache.chats[bucketKey] = chatStateCache.chats[displayKey].map(item => normalizePersistedMessage({ ...item, kbName: displayKey }));
+            delete chatStateCache.chats[displayKey];
+        }
+    });
+    persistChatState(currentKB);
+}
+
 function createMessageId() {
     return `msg_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
 }
@@ -1023,7 +1092,8 @@ function normalizePersistedMessage(raw = {}) {
 
 function loadPersistedMessages(kbName) {
     const safeKB = normalizeKBName(kbName);
-    const rows = chatStateCache.chats && Array.isArray(chatStateCache.chats[safeKB]) ? chatStateCache.chats[safeKB] : [];
+    const bucketKey = chatBucketKeyForKB(safeKB);
+    const rows = chatStateCache.chats && Array.isArray(chatStateCache.chats[bucketKey]) ? chatStateCache.chats[bucketKey] : [];
     return rows.map(item => normalizePersistedMessage({ ...item, kbName: safeKB }));
 }
 
@@ -1031,11 +1101,12 @@ function persistChatState(kbName = currentKB) {
     const storageKey = currentChatStorageKey();
     if (!storageKey) return;
     const safeKB = normalizeKBName(kbName);
+    const bucketKey = chatBucketKeyForKB(safeKB);
     if (!chatStateCache.chats || typeof chatStateCache.chats !== 'object') {
         chatStateCache.chats = {};
     }
-    if (!Array.isArray(chatStateCache.chats[safeKB])) {
-        chatStateCache.chats[safeKB] = [];
+    if (!Array.isArray(chatStateCache.chats[bucketKey])) {
+        chatStateCache.chats[bucketKey] = [];
     }
     chatStateCache.currentKB = normalizeKBName(currentKB || safeKB);
     try {
@@ -1047,10 +1118,11 @@ function persistChatState(kbName = currentKB) {
 
 function setPersistedMessagesForKB(kbName, messages) {
     const safeKB = normalizeKBName(kbName);
+    const bucketKey = chatBucketKeyForKB(safeKB);
     const normalized = (Array.isArray(messages) ? messages : [])
         .map(item => normalizePersistedMessage({ ...item, kbName: safeKB }))
         .slice(-MAX_PERSISTED_MESSAGES_PER_KB);
-    chatStateCache.chats[safeKB] = normalized;
+    chatStateCache.chats[bucketKey] = normalized;
     persistChatState(safeKB);
     return normalized;
 }
@@ -1090,10 +1162,14 @@ function renamePersistedChatState(oldKbName, newKbName) {
     const newKey = normalizeKBName(newKbName);
     if (oldKey === newKey) return;
     const existing = loadPersistedMessages(oldKey);
+    const oldBucketKey = chatBucketKeyForKB(oldKey);
+    const newBucketKey = chatBucketKeyForKB(newKey);
     if (existing.length > 0) {
-        chatStateCache.chats[newKey] = existing.map(item => normalizePersistedMessage({ ...item, kbName: newKey }));
+        chatStateCache.chats[newBucketKey] = existing.map(item => normalizePersistedMessage({ ...item, kbName: newKey }));
     }
+    if (oldBucketKey !== newBucketKey) delete chatStateCache.chats[oldBucketKey];
     delete chatStateCache.chats[oldKey];
+    if (newBucketKey !== newKey) delete chatStateCache.chats[newKey];
     if (chatStateCache.currentKB === oldKey) {
         chatStateCache.currentKB = newKey;
     }
@@ -1102,7 +1178,9 @@ function renamePersistedChatState(oldKbName, newKbName) {
 
 function removePersistedChatState(kbName) {
     const safeKB = normalizeKBName(kbName);
-    delete chatStateCache.chats[safeKB];
+    chatBucketKeysForKB(safeKB).forEach(key => {
+        delete chatStateCache.chats[key];
+    });
     if (chatStateCache.currentKB === safeKB) {
         chatStateCache.currentKB = 'default';
     }
@@ -1708,7 +1786,7 @@ function renderCitationChip(number, label) {
     );
 }
 
-function renderAssistantText(text) {
+function renderAssistantInlineText(text) {
     const raw = String(text || '');
     const citationPattern = /\[\[CITATION:(\d+)\|([^\]\n]{1,240})\]\]/g;
     let html = '';
@@ -1722,7 +1800,78 @@ function renderAssistantText(text) {
     }
 
     html += escapeHtml(raw.slice(lastIndex));
-    return html.replace(/\n/g, '<br>');
+    return html;
+}
+
+function splitAssistantParagraphs(text) {
+    return String(text || '')
+        .replace(/\r\n/g, '\n')
+        .split(/\n{2,}/)
+        .map(block => block.trim())
+        .filter(Boolean);
+}
+
+function isEvidenceParagraph(block) {
+    return /^(?:문서\s*)?근거\s*[:：]/.test(String(block || '').trim());
+}
+
+function isCompactAnswerLine(line) {
+    const normalized = String(line || '').trim();
+    if (!normalized || isEvidenceParagraph(normalized)) return false;
+    if (/^\d+[\.\)]\s+/.test(normalized)) return true;
+    if (/^[가-힣A-Za-z0-9\s]{1,18}\s*[:：]\s+\S/.test(normalized)) return true;
+    return false;
+}
+
+function renderAssistantEvidence(block) {
+    const body = String(block || '').replace(/^(?:문서\s*)?근거\s*[:：]\s*/, '').trim();
+    return (
+        '<div class="answer-evidence" aria-label="답변 근거">' +
+        '<span class="answer-evidence-label">근거</span>' +
+        `<span class="answer-evidence-body">${renderAssistantInlineText(body)}</span>` +
+        '</div>'
+    );
+}
+
+function renderAssistantParagraph(block, index) {
+    const lines = String(block || '').split('\n').map(line => line.trim()).filter(Boolean);
+    if (lines.length > 1 && lines.every(isCompactAnswerLine)) {
+        const rows = lines.map(line => {
+            const numbered = line.match(/^(\d+[\.\)])\s+(.+)$/);
+            const labeled = line.match(/^([가-힣A-Za-z0-9\s]{1,18})\s*[:：]\s+(.+)$/);
+            if (numbered) {
+                return (
+                    '<div class="answer-row">' +
+                    `<span class="answer-row-key">${escapeHtml(numbered[1])}</span>` +
+                    `<span class="answer-row-value">${renderAssistantInlineText(numbered[2])}</span>` +
+                    '</div>'
+                );
+            }
+            if (labeled) {
+                return (
+                    '<div class="answer-row">' +
+                    `<span class="answer-row-key">${escapeHtml(labeled[1].trim())}</span>` +
+                    `<span class="answer-row-value">${renderAssistantInlineText(labeled[2])}</span>` +
+                    '</div>'
+                );
+            }
+            return `<div class="answer-row"><span class="answer-row-value">${renderAssistantInlineText(line)}</span></div>`;
+        }).join('');
+        return `<div class="answer-structured-list">${rows}</div>`;
+    }
+    const body = renderAssistantInlineText(lines.join(' '));
+    const emphasisClass = index === 0 ? ' answer-paragraph-lead' : '';
+    return `<p class="answer-paragraph${emphasisClass}">${body}</p>`;
+}
+
+function renderAssistantText(text) {
+    const blocks = splitAssistantParagraphs(text);
+    if (!blocks.length) return '';
+    return blocks.map((block, index) => (
+        isEvidenceParagraph(block)
+            ? renderAssistantEvidence(block)
+            : renderAssistantParagraph(block, index)
+    )).join('');
 }
 
 function setBubbleText(textDiv, text, role) {
@@ -1863,6 +2012,9 @@ async function loadKBs() {
     }
     const data = await res.json();
     const kbList = Array.isArray(data.kbs) ? data.kbs : [];
+    const kbRecords = Array.isArray(data.kb_records) ? data.kb_records : [];
+    replaceKBRecords(kbList, kbRecords);
+    migratePersistedChatBucketsForRecords();
     if (kbList.length > 0 && !kbList.includes(currentKB)) {
         persistActiveKB(kbList.includes('default') ? 'default' : kbList[0]);
         if (headerTitle) headerTitle.textContent = currentKB;
@@ -2025,9 +2177,13 @@ function showMenu(kb, x, y) {
 document.getElementById('ctx-delete').onclick = async () => {
     if (menuTargetKB === 'default') return alert("기본 공간은 삭제할 수 없습니다.");
     if (!confirm(`'${menuTargetKB}' 공간을 삭제하시겠습니까? 모든 자료가 사라집니다.`)) return;
-    await fetch(apiUrl(`kbs/${encodeURIComponent(menuTargetKB)}`), { method: 'DELETE' });
-    removePersistedChatState(menuTargetKB);
-    if (currentKB === menuTargetKB) selectKB('default');
+    const deletedKB = menuTargetKB;
+    await fetch(apiUrl(`kbs/${encodeURIComponent(deletedKB)}`), { method: 'DELETE' });
+    stopUploadPollingForKB(deletedKB);
+    if (wikiPanel && !wikiPanel.hidden && currentKB === deletedKB) setWikiPanelOpen(false);
+    removePersistedChatState(deletedKB);
+    kbRecordByName.delete(normalizeKBName(deletedKB));
+    if (currentKB === deletedKB) selectKB('default');
     loadKBs();
 };
 
@@ -2040,7 +2196,13 @@ document.getElementById('ctx-rename').onclick = async () => {
         body: JSON.stringify({new_name: newName})
     });
     if (res.ok) {
-        renamePersistedChatState(menuTargetKB, newName);
+        const data = await res.json();
+        const oldName = menuTargetKB;
+        const record = data && data.kb_record ? rememberKBRecord(data.kb_record) : null;
+        renamePersistedChatState(oldName, newName);
+        if (record) {
+            kbRecordByName.delete(normalizeKBName(oldName));
+        }
         if (currentKB === menuTargetKB) {
             persistActiveKB(newName);
             if (headerTitle) headerTitle.textContent = currentKB;
@@ -2057,6 +2219,7 @@ document.getElementById('ctx-rename').onclick = async () => {
 createKbBtn.onclick = async () => {
     const name = prompt("새로운 지침서 공간 이름을 입력하세요:");
     if (!name) return;
+    const hadExistingRecord = kbRecordByName.has(normalizeKBName(name));
     const res = await fetch(apiUrl('kbs'), {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
@@ -2064,6 +2227,8 @@ createKbBtn.onclick = async () => {
     });
     const data = await res.json();
     if (data.status === 'success') {
+        if (data.kb_record) rememberKBRecord(data.kb_record);
+        if (!hadExistingRecord) removePersistedChatState(name);
         await loadKBs();
         selectKB(name);
     } else alert("생성 실패: " + data.error);
@@ -2475,6 +2640,18 @@ function ensureUploadJobPolling({ kbName, messageId, jobId, fileName, roleLabel,
 function stopAllUploadPolling() {
     activeUploadPolls.forEach((pollState, jobId) => {
         if (pollState && pollState.elapsedTimerId) {
+            clearInterval(pollState.elapsedTimerId);
+            pollState.elapsedTimerId = 0;
+        }
+        activeUploadPolls.delete(jobId);
+    });
+}
+
+function stopUploadPollingForKB(kbName) {
+    const safeKB = normalizeKBName(kbName);
+    activeUploadPolls.forEach((pollState, jobId) => {
+        if (!pollState || normalizeKBName(pollState.kbName) !== safeKB) return;
+        if (pollState.elapsedTimerId) {
             clearInterval(pollState.elapsedTimerId);
             pollState.elapsedTimerId = 0;
         }

@@ -12,6 +12,8 @@ OverviewToolExecutor = Callable[[int, int], str]
 SourceOutlineToolExecutor = Callable[[int, int], str]
 ListSourcesToolExecutor = Callable[[], str]
 CitationValidator = Callable[[str], str]
+CitationRepairer = Callable[[str], str]
+AnswerSanitizer = Callable[[str], str]
 
 
 @dataclass
@@ -130,6 +132,8 @@ class CompassAgentDeps:
     source_outline_tool: Optional[SourceOutlineToolExecutor] = None
     list_sources_tool: Optional[ListSourcesToolExecutor] = None
     citation_validator: Optional[CitationValidator] = None
+    citation_repairer: Optional[CitationRepairer] = None
+    answer_sanitizer: Optional[AnswerSanitizer] = None
     require_tool_evidence: bool = False
     tool_event_baseline: int = 0
     allow_retrieval_tool: bool = False

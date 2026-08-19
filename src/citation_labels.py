@@ -155,8 +155,8 @@ def _strip_inline_citation_artifacts(text: str) -> str:
         if not stripped:
             cleaned_lines.append("")
             continue
-        if re.match(r"^근거\s*[:：]", stripped) and PUNCTUATION_ONLY_PATTERN.fullmatch(
-            re.sub(r"^근거\s*[:：]", "", stripped).strip()
+        if re.match(r"^(?:문서\s*)?근거\s*[:：]", stripped) and PUNCTUATION_ONLY_PATTERN.fullmatch(
+            re.sub(r"^(?:문서\s*)?근거\s*[:：]", "", stripped).strip()
         ):
             continue
         if PUNCTUATION_ONLY_PATTERN.fullmatch(stripped):

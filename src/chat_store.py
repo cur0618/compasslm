@@ -23,6 +23,50 @@ def _safe_json_dump(value: Any) -> str:
         return "{}"
 
 
+FAILED_AGENT_RUN_ISSUES = {
+    "answer_stream_fail",
+    "run_exception",
+    "exception_after_candidate",
+    "empty_after_run",
+}
+FAILED_ANSWER_TEXT_MARKERS = (
+    "\ubb38\uc11c \uadfc\uac70\uac00 \ubd80\uc871",
+    "\ubb38\uc11c \uadfc\uac70 \ubd80\uc871",
+    "\uadfc\uac70\uac00 \ubd80\uc871",
+    "\uc9c8\ubb38\uc5d0 \uc9c1\uc811 \ub300\uc751\ud558\ub294 \uadfc\uac70\ub97c \ucc3e\uc9c0 \ubabb",
+    "\ud655\uc778 \uac00\ub2a5\ud55c \uc6d0\ubb38\uc774 \uc788\uc73c\uba74",
+)
+
+
+def _safe_json_loads(value: Any) -> Dict[str, Any]:
+    if not value:
+        return {}
+    try:
+        loaded = json.loads(value)
+    except Exception:
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def is_failed_history_answer_text(text: str) -> bool:
+    compact = " ".join(str(text or "").split()).lower()
+    if not compact:
+        return False
+    return any(marker.lower() in compact for marker in FAILED_ANSWER_TEXT_MARKERS)
+
+
+def _is_failed_agent_run(row: sqlite3.Row) -> bool:
+    issue = str(row["response_quality_issue"] or "").strip()
+    if issue in FAILED_AGENT_RUN_ISSUES:
+        return True
+    if is_failed_history_answer_text(str(row["answer_text"] or "")):
+        return True
+    metadata = _safe_json_loads(row["metadata_json"])
+    failure_code = str(metadata.get("failure_code", "") or "").strip()
+    metadata_issue = str(metadata.get("response_quality_issue", "") or "").strip()
+    return failure_code in FAILED_AGENT_RUN_ISSUES or metadata_issue in FAILED_AGENT_RUN_ISSUES
+
+
 class ChatStore:
     def __init__(
         self,
@@ -381,7 +425,7 @@ class ChatStore:
             c = conn.cursor()
             c.execute(
                 """
-                SELECT new_messages_json
+                SELECT new_messages_json, answer_text, metadata_json, response_quality_issue
                 FROM agent_runs
                 WHERE session_id = ? AND kb_name = ? AND user_id = ?
                 ORDER BY run_id DESC
@@ -394,6 +438,8 @@ class ChatStore:
 
         out: List[ModelMessage] = []
         for row in reversed(rows):
+            if _is_failed_agent_run(row):
+                continue
             payload = row["new_messages_json"]
             if payload is None:
                 continue

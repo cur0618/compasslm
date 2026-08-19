@@ -216,3 +216,72 @@ class UploadJobStore:
             ).fetchall()
             conn.close()
         return [self._row_to_job(row) for row in rows]
+
+    def prune_terminal_jobs(
+        self,
+        *,
+        expire_before: int,
+        max_terminal_rows: int = 5000,
+        batch_size: int = 1000,
+    ) -> int:
+        terminal_statuses = ("success", "error", "timeout", "not_found", "cancelled")
+        limit = max(1, int(batch_size or 1))
+        removed_ids: List[str] = []
+        with self._lock:
+            conn = self._connect()
+            try:
+                placeholders = ",".join("?" for _ in terminal_statuses)
+                if int(expire_before or 0) > 0:
+                    removed_ids.extend(
+                        str(row[0])
+                        for row in conn.execute(
+                            f"""
+                            SELECT job_id FROM upload_jobs
+                            WHERE status IN ({placeholders})
+                              AND updated_at < ?
+                            ORDER BY updated_at ASC, created_at ASC
+                            LIMIT ?
+                            """,
+                            (*terminal_statuses, int(expire_before), limit),
+                        ).fetchall()
+                    )
+                if removed_ids:
+                    delete_placeholders = ",".join("?" for _ in removed_ids)
+                    conn.execute(
+                        f"DELETE FROM upload_jobs WHERE job_id IN ({delete_placeholders})",
+                        tuple(removed_ids),
+                    )
+
+                resolved_max = max(0, int(max_terminal_rows or 0))
+                if resolved_max > 0:
+                    terminal_count = int(
+                        conn.execute(
+                            f"SELECT COUNT(*) FROM upload_jobs WHERE status IN ({placeholders})",
+                            terminal_statuses,
+                        ).fetchone()[0]
+                    )
+                    overflow = max(0, terminal_count - resolved_max)
+                    if overflow:
+                        cap_ids = [
+                            str(row[0])
+                            for row in conn.execute(
+                                f"""
+                                SELECT job_id FROM upload_jobs
+                                WHERE status IN ({placeholders})
+                                ORDER BY updated_at ASC, created_at ASC
+                                LIMIT ?
+                                """,
+                                (*terminal_statuses, min(limit, overflow)),
+                            ).fetchall()
+                        ]
+                        if cap_ids:
+                            cap_placeholders = ",".join("?" for _ in cap_ids)
+                            conn.execute(
+                                f"DELETE FROM upload_jobs WHERE job_id IN ({cap_placeholders})",
+                                tuple(cap_ids),
+                            )
+                            removed_ids.extend(cap_ids)
+                conn.commit()
+            finally:
+                conn.close()
+        return len(set(removed_ids))

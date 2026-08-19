@@ -122,6 +122,61 @@ class UploadJobStoreTests(unittest.TestCase):
                 ["job-processing", "job-queued"],
             )
 
+    def test_prune_terminal_jobs_preserves_active_and_recent_jobs(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = UploadJobStore(str(Path(td) / "app.sqlite"))
+            for job_id, status, updated_at in [
+                ("old-success", "success", 10),
+                ("old-error", "error", 20),
+                ("old-processing", "processing", 5),
+                ("recent-success", "success", 90),
+            ]:
+                store.save_job(
+                    {
+                        "job_id": job_id,
+                        "status": status,
+                        "created_at": updated_at,
+                        "updated_at": updated_at,
+                    }
+                )
+
+            removed = store.prune_terminal_jobs(
+                expire_before=50,
+                max_terminal_rows=10,
+                batch_size=10,
+            )
+
+            self.assertEqual(removed, 2)
+            self.assertIsNone(store.get_job("old-success"))
+            self.assertIsNone(store.get_job("old-error"))
+            self.assertIsNotNone(store.get_job("old-processing"))
+            self.assertIsNotNone(store.get_job("recent-success"))
+
+    def test_prune_terminal_jobs_enforces_newest_row_cap(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = UploadJobStore(str(Path(td) / "app.sqlite"))
+            for index in range(5):
+                store.save_job(
+                    {
+                        "job_id": f"job-{index}",
+                        "status": "success",
+                        "created_at": index + 1,
+                        "updated_at": index + 1,
+                    }
+                )
+
+            removed = store.prune_terminal_jobs(
+                expire_before=0,
+                max_terminal_rows=2,
+                batch_size=10,
+            )
+
+            self.assertEqual(removed, 3)
+            self.assertEqual(
+                [job["job_id"] for job in store.list_jobs()],
+                ["job-4", "job-3"],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

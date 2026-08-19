@@ -31,8 +31,10 @@ from src.compass_ai.models import (
 from src.answer_validation import (
     build_outline_recheck_debug_payload,
     build_tool_recheck_debug_payload,
+    has_grounded_numeric_answer,
     is_grounded_abstention_text,
     is_numeric_evidence_query,
+    repair_answer_text_format,
     should_require_outline_recheck,
     should_require_tool_recheck,
 )
@@ -469,14 +471,21 @@ class PydanticAIService:
             retrieval_meta = retrieval.retrieval_meta or "RETRIEVAL_META:\n(없음)"
             policy_lines = [
                 "- 현재 확보된 근거가 질문에 직접 대응하면 추가 도구 호출 없이 답한다.",
+                "- SEEDED_CONTEXT와 CURRENT_SOURCES에 질문 문장 또는 같은 의미의 처리방법이 있으면 도구를 호출하지 말고 그 근거로 바로 답한다.",
                 "- SEEDED_CONTEXT와 CURRENT_SOURCES를 먼저 읽고, 각 핵심 주장에 이미 확보된 [DOC n]를 연결한다.",
                 "- 질문이 길거나 문서가 길어 보이면 `get_source_outline` 또는 `get_source_overview`로 구조를 먼저 확인한다.",
                 "- 더 읽어야 할 문서가 있으면 `open_document` 또는 `get_source_overview`를 호출한다.",
+                "- 도구가 꼭 필요해도 `search_knowledge_base`는 최대 1회, `open_document`는 최대 2개 문서까지만 사용한다.",
                 "- 현재 확보된 문서 번호만 인용한다. 없는 [DOC n]를 만들면 안 된다.",
                 "- 근거가 질문과 어긋날 때만 검색어를 바꿔 `search_knowledge_base`를 재호출한다.",
             ]
             if not deps.allow_retrieval_tool or deps.search_tool is None:
-                policy_lines = ["- 도구 호출 없이 현재 제공된 힌트와 CONTEXT만으로 답한다."]
+                policy_lines = [
+                    "- 도구 호출 없이 현재 제공된 SEEDED_CONTEXT와 CURRENT_SOURCES만으로 답한다.",
+                    "- 현재 확보된 근거가 질문에 직접 대응하면 추가 도구 호출 없이 답한다.",
+                    "- 각 핵심 주장에 CURRENT_SOURCES의 [DOC n] 인용을 연결한다.",
+                    "- 근거가 부족하면 도구를 호출하지 말고 확인된 범위만 말한다.",
+                ]
             return (
                 f"{retrieval_meta}\n\n"
                 "SOURCE_HINTS:\n"
@@ -506,6 +515,14 @@ class PydanticAIService:
             deps = ctx.deps
             if not deps.allow_retrieval_tool or deps.search_tool is None:
                 raise ModelRetry("검색 도구는 현재 비활성화되어 있다. 현재 확보한 근거만으로 답하라.")
+            recent_events = deps.run_state.tool_events[max(0, int(deps.tool_event_baseline or 0)) :]
+            search_count = sum(1 for event in recent_events if event.tool_name == "search_knowledge_base")
+            if search_count >= 1:
+                return (
+                    "SEARCH_LIMIT_REACHED: search_knowledge_base는 이 답변에서 이미 1회 사용했다. "
+                    "추가 검색을 반복하지 말고 CURRENT_SOURCES와 이미 확보한 [DOC n] 근거로 답하라.\n"
+                    f"{_format_current_sources(deps)}"
+                )
 
             query = (search_query or "").strip() or deps.user_message
             role_hint = (doc_role or "auto").strip().lower() or "auto"
@@ -534,6 +551,18 @@ class PydanticAIService:
                 limit = min(2600, max(400, int(max_chars)))
             except Exception as exc:
                 raise ModelRetry("doc_no와 max_chars는 정수여야 한다.") from exc
+            recent_events = deps.run_state.tool_events[max(0, int(deps.tool_event_baseline or 0)) :]
+            opened_docs = [
+                int((event.arguments or {}).get("doc_no", 0) or 0)
+                for event in recent_events
+                if event.tool_name == "open_document"
+            ]
+            if target_doc_no not in opened_docs and len([doc_no for doc_no in opened_docs if doc_no > 0]) >= 2:
+                return (
+                    "OPEN_DOCUMENT_LIMIT_REACHED: open_document는 이 답변에서 최대 2개 문서까지만 열 수 있다. "
+                    "추가 문서를 열지 말고 이미 열람한 문서와 CURRENT_SOURCES의 [DOC n] 근거로 답하라.\n"
+                    f"{_format_current_sources(deps)}"
+                )
             payload = deps.open_document_tool(target_doc_no, limit)
             if not (payload or "").strip():
                 raise ModelRetry("해당 문서를 열지 못했다. 먼저 검색 결과의 [DOC n]를 확인하라.")
@@ -597,27 +626,119 @@ class PydanticAIService:
         def _validate_answer(ctx: RunContext[CompassAgentDeps], output: str) -> str:
             deps = ctx.deps
             canonical_output = canonicalize_doc_citations(output or "")
+            repaired_format_output = canonicalize_doc_citations(repair_answer_text_format(canonical_output) or "").strip()
+            if repaired_format_output and repaired_format_output != canonical_output.strip():
+                _append_validation_retry_event(
+                    deps,
+                    validator="answer_format_repair",
+                    detail="markdown/style wording repaired before citation validation",
+                    payload={
+                        "candidate_preview": trim_preview(canonical_output, 240),
+                        "repaired_preview": trim_preview(repaired_format_output, 240),
+                    },
+                )
+                canonical_output = repaired_format_output
             candidate_preview = trim_preview(canonical_output, 240)
             candidate_is_grounded_abstention = is_grounded_abstention_text(canonical_output)
             if deps.citation_validator is not None:
                 citation_issue = deps.citation_validator(canonical_output)
                 if citation_issue:
-                    _append_validation_retry_event(
-                        deps,
-                        validator="citation",
-                        detail=citation_issue,
-                        payload={
+                    repaired_output = ""
+                    repaired_issue = ""
+                    if deps.citation_repairer is not None:
+                        try:
+                            repaired_output = canonicalize_doc_citations(deps.citation_repairer(canonical_output) or "").strip()
+                        except Exception as exc:
+                            _append_validation_retry_event(
+                                deps,
+                                validator="citation_repair",
+                                detail=f"citation repair failed: {exc}",
+                                payload={
+                                    "docs_available": len(deps.run_state.docs),
+                                    "available_doc_numbers": sorted(deps.run_state.docs.keys())[:12],
+                                    "candidate_preview": candidate_preview,
+                                },
+                            )
+                            repaired_output = ""
+                        if repaired_output and repaired_output != canonical_output.strip():
+                            repaired_issue = deps.citation_validator(repaired_output)
+                            if not repaired_issue:
+                                _append_validation_retry_event(
+                                    deps,
+                                    validator="citation_repair",
+                                    detail="missing citations repaired from current sources",
+                                    payload={
+                                        "docs_available": len(deps.run_state.docs),
+                                        "available_doc_numbers": sorted(deps.run_state.docs.keys())[:12],
+                                        "candidate_preview": candidate_preview,
+                                        "repaired_preview": trim_preview(repaired_output, 240),
+                                        "previous_issue": citation_issue,
+                                    },
+                                )
+                                canonical_output = repaired_output
+                                candidate_preview = trim_preview(canonical_output, 240)
+                                citation_issue = ""
+                    if not citation_issue:
+                        pass
+                    else:
+                        effective_issue = repaired_issue or citation_issue
+                        retry_payload = {
                             "docs_available": len(deps.run_state.docs),
                             "available_doc_numbers": sorted(deps.run_state.docs.keys())[:12],
                             "candidate_preview": candidate_preview,
-                        },
-                    )
-                    raise ModelRetry(citation_issue)
+                        }
+                        if repaired_issue:
+                            retry_payload["repaired_issue"] = repaired_issue
+                            retry_payload["repaired_preview"] = trim_preview(repaired_output, 240)
+                        _append_validation_retry_event(
+                            deps,
+                            validator="citation",
+                            detail=effective_issue,
+                            payload=retry_payload,
+                        )
+                        raise ModelRetry(effective_issue)
 
             new_events = deps.run_state.tool_events[max(0, int(deps.tool_event_baseline or 0)) :]
             used_tool_names = {event.tool_name for event in new_events}
             analysis = deps.question_analysis or QuestionAnalysis()
             metrics = deps.run_state.latest_metrics or deps.retrieval.metrics or {}
+            if deps.answer_sanitizer is not None:
+                try:
+                    sanitized_output = canonicalize_doc_citations(deps.answer_sanitizer(canonical_output) or "").strip()
+                except Exception as exc:
+                    _append_validation_retry_event(
+                        deps,
+                        validator="answer_sanitizer",
+                        detail=f"answer sanitizer failed: {exc}",
+                        payload={"candidate_preview": candidate_preview},
+                    )
+                    sanitized_output = ""
+                if sanitized_output and sanitized_output != canonical_output.strip():
+                    _append_validation_retry_event(
+                        deps,
+                        validator="answer_sanitizer",
+                        detail="outside-document paragraph removed",
+                        payload={
+                            "candidate_preview": candidate_preview,
+                            "sanitized_preview": trim_preview(sanitized_output, 240),
+                        },
+                    )
+                    canonical_output = sanitized_output
+                    candidate_preview = trim_preview(canonical_output, 240)
+                    candidate_is_grounded_abstention = is_grounded_abstention_text(canonical_output)
+                    if deps.citation_validator is not None:
+                        sanitized_citation_issue = deps.citation_validator(canonical_output)
+                        if sanitized_citation_issue:
+                            _append_validation_retry_event(
+                                deps,
+                                validator="citation",
+                                detail=sanitized_citation_issue,
+                                payload={
+                                    "candidate_preview": candidate_preview,
+                                    "reason": "sanitized_output_lost_citation",
+                                },
+                            )
+                            raise ModelRetry(sanitized_citation_issue)
             auto_prefetch_satisfied = bool(
                 {"open_document", "get_source_outline", "get_source_overview"} & used_tool_names
             )
@@ -635,6 +756,11 @@ class PydanticAIService:
                 auto_prefetch_satisfied=auto_prefetch_satisfied,
                 candidate_is_grounded_abstention=candidate_is_grounded_abstention,
                 query_text=deps.user_message,
+                evidence_texts=evidence_texts,
+            )
+            candidate_numeric_grounded = has_grounded_numeric_answer(
+                query=deps.user_message,
+                answer_text=canonical_output,
                 evidence_texts=evidence_texts,
             )
 
@@ -673,6 +799,8 @@ class PydanticAIService:
                 and deps.allow_retrieval_tool
                 and not ({"open_document", "get_source_outline", "get_source_overview"} & used_tool_names)
             ):
+                if candidate_numeric_grounded and bool(tool_recheck_payload.get("seeded_retrieval_evidence_ok", False)):
+                    return canonical_output
                 _append_validation_retry_event(
                     deps,
                     validator="numeric_recheck",
@@ -785,7 +913,7 @@ class PydanticAIService:
                 if deps.allow_retrieval_tool and deps.source_outline_tool is not None and deps.run_state.docs:
                     enabled.append(tool)
             elif tool.name == "list_current_sources":
-                if deps.run_state.docs:
+                if deps.allow_retrieval_tool and deps.run_state.docs:
                     enabled.append(tool)
             else:
                 enabled.append(tool)
@@ -1310,11 +1438,14 @@ class PydanticAIService:
         run_metadata: Optional[Dict[str, Any]] = None,
     ):
         has_runtime_tools = bool(
-            deps.search_tool
-            or deps.open_document_tool
-            or deps.source_overview_tool
-            or deps.source_outline_tool
-            or deps.list_sources_tool
+            deps.allow_retrieval_tool
+            and (
+                deps.search_tool
+                or deps.open_document_tool
+                or deps.source_overview_tool
+                or deps.source_outline_tool
+                or deps.list_sources_tool
+            )
         )
         tool_calls_limit = (
             self.settings.tool_calls_limit

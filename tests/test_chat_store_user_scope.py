@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from src.chat_store import ChatStore
+from src.chat_store import ChatStore, is_failed_history_answer_text
 
 
 class ChatStoreUserScopeTests(unittest.TestCase):
@@ -34,6 +34,18 @@ class ChatStoreUserScopeTests(unittest.TestCase):
 
             self.assertEqual([run["query_id"] for run in alice_runs], ["q1"])
             self.assertEqual([run["query_id"] for run in bob_runs], ["q2"])
+
+    def test_failed_no_evidence_answer_text_is_marked_for_prompt_history_filtering(self):
+        self.assertTrue(
+            is_failed_history_answer_text(
+                "\ubb38\uc11c \uadfc\uac70\uac00 \ubd80\uc871\ud574 \ud655\uc815\uc801\uc73c\ub85c \uc548\ub0b4\ud558\uae30 \uc5b4\ub835\uc2b5\ub2c8\ub2e4."
+            )
+        )
+        self.assertFalse(
+            is_failed_history_answer_text(
+                "\ucc98\ub9ac: \uc815\uae30\uc801\uc73c\ub85c \ubc1b\ub294 \uc218\ub2f9\uc740 \uc218\uc785\uc73c\ub85c \uc870\uc0ac\ud569\ub2c8\ub2e4. [DOC 1]"
+            )
+        )
 
 
 if __name__ == "__main__":

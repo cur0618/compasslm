@@ -168,8 +168,8 @@ class TableFactTests(unittest.TestCase):
         self.assertEqual(rows[0]["table_id"], "지급기준:table:1")
         self.assertEqual(rows[0]["row_no"], 2)
         self.assertEqual(rows[0]["parent_chunk_key"], "xlsx:지급기준:table:1:row:2")
-        self.assertIn("문서:", rows[0]["embedding_text"])
-        self.assertIn("경로: 지급기준", rows[0]["embedding_text"])
+        self.assertIn("source=", rows[0]["embedding_text"])
+        self.assertIn("path=지급기준", rows[0]["embedding_text"])
 
     def test_xlsx_structure_loader_separates_multiple_tables_in_one_sheet(self):
         try:
