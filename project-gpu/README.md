@@ -5,8 +5,9 @@
 
 공개 저장소의 공통 기준 설정은 `runtime.env.example`이다. 먼저
 `cp project-gpu/runtime.env.example project-gpu/runtime.env`로 복사하고 실제 경로와
-비밀 키를 입력한다. 서비스별 `.env.example`은 필요한 값만 나중에 덮어쓸 때
-사용한다. 모델 형식과 정확한 배치 경로는
+비밀 키를 입력한다. 설정 우선순위는 `서비스별 .env < 서비스별 .env.auto <
+runtime.env < 실행 셸 환경변수`이며, 서비스별 `.env`는 낮은 우선순위의 호환
+기본값으로만 사용한다. 모델 형식과 정확한 배치 경로는
 [`../docs/MODELS_AND_ASSETS.md`](../docs/MODELS_AND_ASSETS.md)를 참고한다.
 
 ## 1) 경로 준비
@@ -205,10 +206,11 @@ API_RELOAD=1 project-gpu/run_backend_api.sh
 
 ## 7) 원격 GPU 임베딩 서버 사용
 기본값은 같은 컴퓨터의 `127.0.0.1` 연결이다. 임베딩 서버를 원격에서 제공할 때만
-아래처럼 노출 범위를 의도적으로 바꾼다. 서비스별 .env 파일은 `.env.auto`와
-`runtime.env`보다 마지막에 읽혀 앞선 공통값을 덮어쓴다.
+아래처럼 노출 범위를 의도적으로 바꾼다. `runtime.env`가 서비스 `.env`와
+`.env.auto`보다 우선하므로 각 호스트의 `runtime.env`에 최종값을 둔다. 한 번만
+시험할 값은 런처 앞의 실행 셸 환경변수로 지정한다.
 
-임베딩 서버의 최종 `project-gpu/embedding-gpu-server/.env`:
+임베딩 서버의 최종 `project-gpu/runtime.env`:
 
 ```bash
 COMPASS_AUTO_PORT=0
@@ -217,7 +219,7 @@ EMBED_PORT=8002
 EMBEDDING_API_KEY=replace-with-strong-secret
 ```
 
-백엔드의 최종 `project-gpu/main-backend/.env`:
+백엔드의 최종 `project-gpu/runtime.env`:
 
 ```bash
 COMPASS_AUTO_PORT=0

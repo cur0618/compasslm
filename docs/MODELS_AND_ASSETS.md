@@ -9,13 +9,13 @@
 각 실행 스크립트는 다음 순서로 설정을 읽습니다.
 
 ```text
-.env.auto → project-gpu/runtime.env → 서비스별 .env
+서비스별 .env → 서비스별 .env.auto → project-gpu/runtime.env → 실행 셸 환경변수
 ```
 
 나중에 읽은 파일이 앞선 값을 덮어쓴다. `project-gpu/runtime.env.example`이 공개
-공통 기준이며, 서비스별 `.env.example`은 꼭 필요한 차이만 넣는 선택적 override
-예시입니다. 자동 생성 파일인 `.env.auto`를 직접 수정하기보다 정본을 복사한
-`runtime.env`에 공통값을 두세요.
+공통 기준이며, 정본을 복사한 `runtime.env`에 공통값을 둡니다. 서비스별 `.env`는
+낮은 우선순위의 호환 기본값이고 `.env.auto`는 설치 과정에서 생성되므로 직접
+수정하지 마세요. 한 번만 바꿀 값은 실행 셸 환경변수로 지정합니다.
 
 기본 호스트는 `127.0.0.1`로 유지합니다. 원격 연결을 명시적으로 구성하지 않는 한
 `0.0.0.0`로 바꾸지 마세요. `EMBEDDING_API_KEY`는 임베딩 서버와 백엔드에서 같은

@@ -373,10 +373,14 @@ class PublicDocumentationContractTests(unittest.TestCase):
         ):
             with self.subTest(excluded=excluded):
                 self.assertIn(excluded, readme)
-        self.assertRegex(readme, r"\.env\.auto\s*(?:→|->)\s*project-gpu/runtime\.env\s*(?:→|->)\s*서비스별 `?\.env`?")
-        self.assertIn("선택적인", readme)
-        self.assertIn("덮어쓰기", readme)
-        self.assertIn("무작정", readme)
+        self.assertRegex(
+            readme,
+            r"서비스별 `?\.env`?\s*(?:→|->)\s*서비스별 `?\.env\.auto`?"
+            r"\s*(?:→|->)\s*project-gpu/runtime\.env\s*(?:→|->)\s*실행 셸 환경변수",
+        )
+        self.assertIn("낮은 우선순위", readme)
+        self.assertIn("덮어씁니다", readme)
+        self.assertIn("직접 수정하지", readme)
 
         normalized = " ".join(readme.split())
         self.assert_contains_all(
@@ -394,6 +398,28 @@ class PublicDocumentationContractTests(unittest.TestCase):
         self.assertNotIn(
             "embedding API :8002 → llama.cpp LLM :8003 → backend/UI :8004",
             normalized,
+        )
+
+    def test_root_readme_documents_the_current_operator_and_repository_workflow(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assert_contains_all(
+            readme,
+            (
+                "TXT, XLSX, HWPX, PDF",
+                "계정별 지식공간",
+                "비동기 2단계",
+                "Wiki answer memory",
+                "Ontology-RAG",
+                "scripts/create_admin_user.py",
+                "project-gpu/compass_up.sh",
+                "project-gpu/compass_status.sh",
+                "project-gpu/compass_logs.sh backend -f",
+                "project-gpu/compass_down.sh",
+                "GitHub를 기준 저장소",
+                "공공 GitLab에 자동 반영",
+                ".github/workflows/mirror-to-aigov-gitlab.yml",
+                "GitLab Auto DevOps",
+            ),
         )
 
     def test_model_asset_guide_maps_formats_paths_and_configuration(self) -> None:
@@ -440,7 +466,7 @@ class PublicDocumentationContractTests(unittest.TestCase):
                 "PDF_OCR_BACKEND",
                 "PDF_OCR_DEVICE",
                 "PDF_OCR_ALLOW_ONLINE_MODEL_FALLBACK=0",
-                ".env.auto → project-gpu/runtime.env → 서비스별 .env",
+                "서비스별 .env → 서비스별 .env.auto → project-gpu/runtime.env → 실행 셸 환경변수",
                 "나중에 읽은 파일이 앞선 값을 덮어쓴다",
                 "127.0.0.1",
                 "project-gpu/install_llama_cuda_runtime.sh",
@@ -468,14 +494,14 @@ class PublicDocumentationContractTests(unittest.TestCase):
         self.assert_contains_all(
             guide,
             (
-                "project-gpu/embedding-gpu-server/.env",
+                "서비스별 .env < 서비스별 .env.auto < runtime.env < 실행 셸 환경변수",
+                "임베딩 서버의 최종 `project-gpu/runtime.env`",
                 "EMBED_HOST=0.0.0.0",
                 "EMBED_PORT=8002",
-                "project-gpu/main-backend/.env",
+                "백엔드의 최종 `project-gpu/runtime.env`",
                 "COMPASS_AUTO_PORT=0",
                 "EMBEDDING_API_URL=https://",
-                "서비스별 .env",
-                "마지막에 읽혀",
+                "`runtime.env`가 서비스 `.env`와 `.env.auto`보다 우선",
                 "firewall allowlist",
                 "plaintext Bearer",
                 "public Internet",
