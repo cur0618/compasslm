@@ -1,23 +1,30 @@
-# CompassLM Local Fonts
+# CompassLM 로컬 폰트 배치
 
-이 폴더의 폰트는 폐쇄망 서버에서도 동일한 UI를 유지하기 위한 로컬 정적 자산입니다.
+공개 저장소에는 폰트 바이너리를 포함하지 않으며 이 안내 파일만 제공합니다. 아래
+이름과 호환되는 WOFF2 파일을 각 폰트의 라이선스와 재배포 조건에 따라 합법적으로
+확보해 이 디렉터리에 직접 배치하세요.
 
 - `compass-display.woff2`
-  브랜드명, KB 제목, 배지, 주요 버튼, 라벨에 쓰는 display font
+  브랜드명, 지식공간 제목, 배지, 주요 버튼과 라벨에 쓰는 표시용 글꼴
 - `compass-body.woff2`
-  채팅 본문, 파일 목록, 설명문, 입력창에 쓰는 body font
+  채팅 본문, 파일 목록, 설명문과 입력창에 쓰는 본문용 글꼴
 - `compass-mono.woff2`
-  citation 번호와 정밀 메타 표시에 쓰는 mono font
+  인용 번호와 정밀 메타데이터 표시에 쓰는 고정폭 글꼴
 
-출처
+## 호환 글꼴 예시
 
-- `compass-display.woff2`: Pretendard GOV Variable 배포본
-- `compass-body.woff2`: Pretendard Variable 배포본
-- `compass-mono.woff2`: JetBrains Mono Regular Webfont 배포본
+- 표시용: Pretendard GOV Variable 계열
+- 본문용: Pretendard Variable 계열
+- 고정폭: JetBrains Mono Regular 계열
 
-운영 규칙
+예시는 디자인 역할을 설명하기 위한 것이며 특정 배포본의 포함 또는 재배포 권한을
+뜻하지 않습니다. 사용 전에 원본 프로젝트의 라이선스와 기관의 반입 정책을 직접
+확인하세요.
+
+## 운영 규칙
 
 - 외부 CDN이나 원격 폰트 링크는 사용하지 않습니다.
-- 파일 이름은 위의 canonical 이름을 유지합니다.
-- 교체가 필요하면 동일 역할의 `woff2` 파일만 덮어쓰고, `style.css`의 경로와 토큰 이름은 유지합니다.
-- 폐쇄망 반입 시 이 폴더 전체를 함께 배포해야 합니다.
+- 파일 이름은 위 세 이름을 유지합니다. `src/static/style.css`가 이 경로를 직접 참조합니다.
+- 파일이 없으면 브라우저는 `style.css`에 정의된 시스템 대체 글꼴을 사용합니다.
+- 폐쇄망 배포 묶음에는 승인받은 WOFF2 파일을 소스와 별도로 포함합니다.
+- 폰트 바이너리는 공개 Git 저장소에 커밋하지 않습니다.

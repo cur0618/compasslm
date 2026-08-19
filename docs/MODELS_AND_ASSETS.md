@@ -90,9 +90,14 @@ project-gpu/embedding-gpu-server/models/Qwen/Qwen3-Embedding-0.6B/
 지원됩니다. 대체 모델을 쓰면 임베딩 차원과 의존성 요구사항을 확인하고 기존
 인덱스를 새 모델로 다시 생성하세요.
 
-## OCR: PaddleOCR-VL 로컬 디렉터리
+## OCR: 빠른 경로와 PaddleOCR-VL 로컬 자산
 
-기본 OCR 구성은 네 디렉터리를 사용합니다.
+공개 기준 설정은 `PDF_OCR_BACKEND=ppocr_fast_v1`과
+`PDF_OCR_FAST_LANG=korean`입니다. 이 경로가 빠른 한국어 PaddleOCR 처리를 담당하고,
+`PDF_OCR_FAST_VL_FALLBACK=0`이므로 품질 판정 실패 시 VL 모델로 자동 전환하지
+않습니다. VL 처리가 필요한 문서에는 `PDF_OCR_BACKEND=vl_only`를 명시합니다.
+
+VL 경로와 문서 구조 보조 기능은 다음 네 로컬 디렉터리를 사용합니다.
 
 ```text
 project-gpu/main-backend/models/ocr/PaddleOCR-VL
@@ -108,12 +113,19 @@ project-gpu/main-backend/models/ocr/UVDoc
 - `PDF_OCR_DOC_ORIENTATION_MODEL_DIR` → `PP-LCNet_x1_0_doc_ori`
 - `PDF_OCR_DOC_UNWARP_MODEL_DIR` → `UVDoc`
 - `PDF_OCR_BACKEND`: 사용할 OCR backend
+- `PDF_OCR_FAST_LANG=korean`: 빠른 OCR 경로의 언어
+- `PDF_OCR_FAST_VL_FALLBACK=0`: 빠른 경로에서 VL로 자동 전환하지 않음
 - `PDF_OCR_DEVICE`: `gpu`, `cuda...`, `cpu` 등 실행 장치
 - `PDF_OCR_ALLOW_ONLINE_MODEL_FALLBACK=0`: 누락 모델을 실행 중 인터넷에서 받지 않음
 
 경로가 모델 폴더 자체를 가리키는지 확인하세요. 상위 `models/ocr`만 지정하면 각
 구성 요소를 찾지 못할 수 있습니다. 다른 호환 PaddleOCR 모델을 쓸 때에는 네 역할과
 각 환경 변수를 개별적으로 맞춰야 합니다.
+
+PaddleOCR HPS는 기본 경로가 아니라 별도의 배포 번들과 검증이 필요한 선택형
+백엔드입니다. HPS 준비와 벤치마크 절차는
+[`../project-gpu/paddleocr-hps/README.md`](../project-gpu/paddleocr-hps/README.md)를
+따르고, 승인 기준을 통과한 환경에서만 `PDF_OCR_BACKEND=hps`로 전환하세요.
 
 ## 배치 확인
 

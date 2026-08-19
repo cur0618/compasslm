@@ -1,7 +1,8 @@
-# project-gpu 운영 가이드 (GPU-only, 2026-02-16)
+# project-gpu 운영 가이드
 
 `project-gpu`는 임베딩 서버(FastAPI)와 백엔드/LLM 서버를 분리해 운영하는 단일 트랙이다.
-로컬(`project-local`) 트랙은 폐기되었고 본 문서 기준으로만 운영한다.
+일반 운영에서는 9절의 통합 실행기를 권장하고, 개별 서버를 따로 진단해야 할 때만
+6절의 수동 실행 절차를 사용한다.
 
 공개 저장소의 공통 기준 설정은 `runtime.env.example`이다. 먼저
 `cp project-gpu/runtime.env.example project-gpu/runtime.env`로 복사하고 실제 경로와
@@ -41,7 +42,7 @@ project-gpu/load_gpu_env.sh --print
 - `project-gpu/main-backend/models/llm/qwen3.5-9b/qwen3.5-9b-q4_k_m.gguf`
 
 명시 고정이 필요하면:
-- `project-gpu/main-backend/.env`에 `LLM_MODEL_PATH=/absolute/path/to/model.gguf`
+- `project-gpu/runtime.env`에 `LLM_MODEL_PATH=/absolute/path/to/model.gguf`
 
 ## 3) 필수 자산 배치
 - 임베딩 모델:
@@ -133,9 +134,9 @@ project-gpu/setup_gpu_track.sh --python python3.11 --offline-embed --offline-bac
 
 백엔드 메모:
 - 메인 채팅 오케스트레이션은 `PydanticAI`를 사용한다.
-- OpenAI 호환 LLM 서버를 쓸 때는 `.env`에 `LLM_MODEL_NAME`을 실제 서버 model alias와 맞춰 두는 것을 권장한다.
+- OpenAI 호환 LLM 서버를 쓸 때는 `project-gpu/runtime.env`의 `LLM_MODEL_NAME`을 실제 서버 모델 별칭과 맞춰 두는 것을 권장한다.
 - 브라우저 세션 대화 이력은 기본적으로 `data/app.sqlite`에 저장된다.
-- PDF는 기본적으로 `PDF_PARSE_MODE=ocr_first`로 `PaddleOCR-VL` 결과를 먼저 색인한다. `PyMuPDF`는 OCR 실패, 빈 OCR 결과, OCR page limit 초과분의 보조 fallback으로만 사용한다.
+- PDF는 기본적으로 `PDF_PARSE_MODE=ocr_first`, `PDF_OCR_BACKEND=ppocr_fast_v1`, `PDF_OCR_FAST_LANG=korean`으로 빠른 PaddleOCR 경로를 먼저 사용한다. `PDF_OCR_FAST_VL_FALLBACK=0`이므로 VL 경로로 자동 전환하지 않으며, 고품질 VL 처리가 필요할 때만 `PDF_OCR_BACKEND=vl_only`를 명시한다. `PyMuPDF`는 OCR 실패, 빈 OCR 결과, OCR 페이지 제한 초과분의 보조 경로다.
 - V100 32GB 기준 fast profile은 `PDF_OCR_OPTIMIZATION_PROFILE=v100_32gb_fast`이며, 기본 목표는 `PDF_OCR_TARGET_PAGES=200`, `PDF_OCR_TARGET_SECONDS=300`이다.
 - `PDF_OCR_GPU_PROCESS_ISOLATION=1`은 GPU OCR을 별도 worker process에서 실행해 OCR 완료 후 Paddle/CUDA VRAM을 process 종료로 회수하기 위한 기본값이다.
 - 웹 업로드는 업로드마다 별도 `.sh`를 실행하지 않는다. `run_backend_api.sh`가 OCR env를 읽고 FastAPI를 기동한 뒤, `/upload` 요청은 백엔드 Python 프로세스 안에서 `src.main` 업로드 큐 -> `RAGEngine.ingest_file()` -> `src.pdf_ocr.extract_pdf_pages()` 경로로 처리된다. `benchmark_pdf_ocr_v100.sh`와 `tune_pdf_ocr_v100_matrix.sh`는 같은 OCR 경로를 직접 호출하는 실측/튜닝 도구다.
@@ -168,7 +169,10 @@ project-gpu/apply_pdf_ocr_tuned_profile.sh logs/ocr-benchmarks/<run>_v100_matrix
 
 `summary.json`의 `target_achieved=true`가 실제 목표 달성 기준이다. 더 엄격하게 확인하려면 `verify_pdf_ocr_v100_target.sh summary.json [max-peak-gpu-mb] [max-process-rss-mb]`를 실행해 `ocr_pages>=200`, `elapsed_seconds<=300`, 선택적 peak VRAM/process tree RSS 상한을 함께 검증한다. `run_pdf_ocr_v100_acceptance.sh` 통과 시 `logs/ocr-benchmarks/<run>_v100_acceptance/acceptance_report.json`이 최종 증거 파일이며, checklist의 `ocr_pages_ge_target`, `elapsed_seconds_le_target`, `peak_gpu_le_limit`, `process_rss_le_limit`를 확인한다.
 
-## 6) 서버 실행 순서
+## 6) 개별 서버 실행 대안
+통합 실행이 어려운 진단 상황에서만 아래 순서로 각 서버를 실행한다. 일반 운영은
+9절의 `project-gpu/compass_up.sh`를 사용한다.
+
 실행 전에 먼저 아래를 확인:
 ```bash
 cd ~/compasslm
@@ -197,12 +201,14 @@ project-gpu/run_llm_server.sh
 터미널 3: 백엔드 API
 ```bash
 cd ~/compasslm
-API_RELOAD=1 project-gpu/run_backend_api.sh
+project-gpu/run_backend_api.sh
 ```
 
 확인: `[READY] backend url=http://127.0.0.1:<선택포트>` 로그가 출력됩니다.
+개발 중 코드 자동 재적재가 필요할 때만
+`API_RELOAD=1 project-gpu/run_backend_api.sh`를 사용합니다.
 
-자동 포트 모드에서 backend는 runtime state의 준비 완료 embedding URL만 사용합니다. 준비 완료 state가 없거나 PID, `/health`, 인증, `/embed` probe가 실패하면 `.env`의 `8002`로 fallback하지 않고 기동을 중단합니다.
+자동 포트 모드에서 backend는 runtime state의 준비 완료 embedding URL만 사용합니다. 준비 완료 state가 없거나 PID, `/health`, 인증, `/embed` probe가 실패하면 고정 기본 포트 `8002`로 임의 전환하지 않고 기동을 중단합니다.
 
 ## 7) 원격 GPU 임베딩 서버 사용
 기본값은 같은 컴퓨터의 `127.0.0.1` 연결이다. 임베딩 서버를 원격에서 제공할 때만
@@ -239,8 +245,10 @@ JupyterHub 등의 사용자별 reverse proxy를 통할 때 경로 예시는
 
 ## 8) 스모크 테스트
 1. backend `[READY]` 로그에 출력된 URL로 접속
-2. `.txt`/`.xlsx` 업로드
-3. 질문 입력 후 근거 포함 응답 확인
+2. 지원 형식인 TXT, XLSX, HWPX, PDF 중 운영에 사용할 대표 문서를 업로드
+3. 업로드 처리 완료와 색인 상태 확인
+4. 질문 입력 후 원문 근거와 인용이 포함된 응답 확인
+
 ## 9) 통합 실행 권장 방식
 
 Jupyter GPU 환경에서는 tmux 기반 통합 실행기를 권장한다.
